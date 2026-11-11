@@ -1,11 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════╗
 ║         AppX / Parmar Academy Downloader             ║
-║           Telegram Bot Edition — v1.2                ║
+║           Telegram Bot Edition — v1.3                ║
 ║   Fixes applied:                                     ║
 ║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
 ║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
 ║     3. Option 6 — Download EVERYTHING in one shot   ║
+║     4. Auto-Update Scheduler integrated              ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -25,6 +26,12 @@ COMMANDS:
   /plan    — Check your subscription
   /broadcast — Broadcast to all users (owner only)
   /broadusers — List broadcast users (owner only)
+
+  AUTO-UPDATE COMMANDS:
+  /addauto   — Set up a new auto-update watcher
+  /myautos   — List all your auto-update configs
+  /delauto   — Delete an auto-update config
+  /runnow    — Trigger an auto-update immediately
 """
 
 import os
@@ -42,14 +49,13 @@ import requests
 import subprocess
 import urllib
 import urllib.parse
+import logging as _logging
 
 import aiohttp
 import aiofiles
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-from pyrogram import idle
-
 
 from logs import logging
 import saini as helper
@@ -66,9 +72,14 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, InputUserDeactivated
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.handlers import MessageHandler
 from subprocess import getstatusoutput
 from aiohttp import ClientSession
-from scheduler import start_scheduler
+
+# ── Scheduler imports ─────────────────────────────────────────────────
+from datetime import datetime, timezone, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ══════════════════════════════════════════════════════
 #  CONSTANTS  (AppX / HAR-verified)
@@ -123,6 +134,13 @@ def proxy_mp4_url(url: str) -> str:
     return PROXY_BASE + urllib.parse.quote(url, safe="")
 
 # ══════════════════════════════════════════════════════
+#  SCHEDULER CONSTANTS
+# ══════════════════════════════════════════════════════
+
+MAX_AUTOS_PER_USER = 100
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# ══════════════════════════════════════════════════════
 #  BOT INIT
 # ══════════════════════════════════════════════════════
 
@@ -146,11 +164,6 @@ BUTTONS_CONTACT = InlineKeyboardMarkup([[
 # ══════════════════════════════════════════════════════
 
 async def safe_progress_edit(bot_client, chat_id, msg, text, **kwargs):
-    """
-    Edit a progress message. If it was deleted (e.g. by helper.send_vid
-    after upload), send a new one and return it so the caller can keep
-    using it.
-    """
     try:
         await msg.edit_text(text, **kwargs)
         return msg
@@ -453,12 +466,6 @@ _CDN_MIGRATIONS = {
 
 
 def _norm_q(q) -> str:
-    """Normalise API quality labels to the 'Np' form we compare against.
-
-    The AppX / ClassX API sometimes returns quality as a bare integer
-    (720, 480 …) and sometimes already with the 'p' suffix (720p, 480p).
-    All internal comparisons use the 'Np' form, so we normalise here.
-    """
     s = str(q).strip()
     if s.isdigit():
         return s + "p"
@@ -490,7 +497,7 @@ def _is_mp4_url(url: str) -> bool:
         return False
     lower = url.lower()
     path  = lower.split("?")[0]
-    if path.endswith(".pdf"):          # never treat PDF URLs as mp4
+    if path.endswith(".pdf"):
         return False
     if "static-db.appx.co.in" in lower:
         return True
@@ -502,10 +509,6 @@ def _is_mp4_url(url: str) -> bool:
 
 
 def _mp4_headers(url: str) -> dict:
-    """
-    Full headers matching exact HAR capture of working MP4 download.
-    Icy-MetaData + Host + Range are required by Google-Edge-Cache CDN.
-    """
     from urllib.parse import urlparse
     host = urlparse(url).netloc
     base = {
@@ -555,7 +558,6 @@ def _best_download_link(d: dict, prefer_quality: str = "720p") -> str:
 
 
 def decrypt_all_links(d: dict) -> list:
-    quality_rank = {"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "240p": 4, "144p": 5}
     seen: set   = set()
     results: list = []
 
@@ -596,8 +598,6 @@ def decrypt_all_links(d: dict) -> list:
     if dl:
         _add("download_link", dl)
 
-    # Keep insertion order (encrypted_links first, then download_links).
-    # Caller reorders by preference — don't sort here.
     return results
 
 
@@ -624,11 +624,6 @@ def _resolve_pdf_url(pdf_link: str, pdf_key: str) -> str:
 
 
 def _extract_class_pdfs(d: dict) -> list:
-    """
-    Returns list of (suffix, url) for ALL PDFs on a lecture item.
-    Checks every known field name AppX APIs use for PDFs.
-    e.g. [("", url1), ("_2", url2)]
-    """
     seen: set = set()
     pdfs: list = []
 
@@ -638,19 +633,16 @@ def _extract_class_pdfs(d: dict) -> list:
             seen.add(url)
             pdfs.append((suffix, url))
 
-    # ── Primary PDF (pdf_link / pdf_summary_link / notes_link) ───────────
     p1 = _resolve_pdf_url(d.get("pdf_link", ""), d.get("pdf_encryption_key", ""))
     if not p1:
         p1 = d.get("pdf_summary_link", "") or d.get("notes_link", "") or d.get("notes_pdf", "")
     _add("", p1)
 
-    # ── Second PDF (pdf_link2 / pdf2_summary_link) ────────────────────────
     p2 = _resolve_pdf_url(d.get("pdf_link2", ""), d.get("pdf2_encryption_key", ""))
     if not p2:
         p2 = d.get("pdf2_summary_link", "")
     _add("_2", p2)
 
-    # ── Extra field names different AppX forks use ────────────────────────
     for suffix, key in [
         ("_3",  "pdf_link3"),
         ("_4",  "pdf_link4"),
@@ -721,7 +713,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
         return (title, d["embed_url"],
                 None, "youtube", class_pdfs, all_candidates)
 
-    # ── Build a quality → url map (video only, no DRM, no PDF) ──────────
     ALL_QUALITIES = ["1080p", "720p", "480p", "360p", "240p", "144p"]
     by_quality: dict = {}
     for qlabel, cand_url in all_candidates:
@@ -729,7 +720,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
             if qlabel not in by_quality:
                 by_quality[qlabel] = cand_url
 
-    # ── Pick primary URL: preferred quality first ────────────────────────
     prefer_order = [prefer_quality] + [q for q in ALL_QUALITIES if q != prefer_quality] + ["file_link", "download_link"]
     chosen_url   = None
     for q in prefer_order:
@@ -742,15 +732,11 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
     if chosen_url:
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
 
-        # ── Reorder all_candidates: preferred → lower → higher ──────────
-        # For each quality, ALL its URLs (path, backup_url, backup_url2)
-        # are tried before dropping to the next lower quality.
         pref_idx = ALL_QUALITIES.index(prefer_quality) if prefer_quality in ALL_QUALITIES else 1
         lower    = ALL_QUALITIES[pref_idx + 1:]
         higher   = list(reversed(ALL_QUALITIES[:pref_idx]))
         fallback_order = [prefer_quality] + lower + higher + ["file_link", "download_link"]
 
-        # Build a map of quality → ALL its URLs (not just the first one)
         by_quality_all: dict = {}
         for qlabel, cand_url in all_candidates:
             if not _is_drm_url(cand_url):
@@ -765,7 +751,6 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
                     seen_urls.add(url_q)
                     ordered.append((q, url_q))
 
-        # Append anything not yet covered (unknown quality labels)
         for qlabel, cand_url in all_candidates:
             if cand_url not in seen_urls and not _is_drm_url(cand_url):
                 seen_urls.add(cand_url)
@@ -843,12 +828,10 @@ def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = 
         return None
     out = f"{out_path}_quiz.html"
     try:
-        # ── Load template from same directory as this script ──────────────
         template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz_template.html")
         with open(template_path, "r", encoding="utf-8") as f:
             template = f.read()
 
-        # ── Build QUESTIONS array in the format the template expects ──────
         import json as _json
         js_questions = []
         for idx, q in enumerate(questions, 1):
@@ -860,12 +843,10 @@ def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = 
                 q.get("answer") or q.get("correct_answer")
                 or q.get("correct_option") or q.get("correct") or "1"
             ).strip()
-            # Normalise answer to option number string "1"–"5"
             try:
-                int(answer_raw)          # already a number string
+                int(answer_raw)
                 answer_str = answer_raw
             except ValueError:
-                # letter like "A"→"1", "B"→"2" …
                 answer_str = str(ord(answer_raw.upper()) - ord("A") + 1)
 
             obj = {
@@ -876,7 +857,6 @@ def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = 
                 "negative_score": q.get("negative_score", 0),
                 "solution_text":  q.get("solution_text") or q.get("explanation") or q.get("solution") or "",
             }
-            # Options: try option_1…option_5 first, then list field
             for n in range(1, 6):
                 val = q.get(f"option_{n}", "")
                 if val:
@@ -893,17 +873,13 @@ def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = 
             js_questions.append(obj)
 
         questions_array = _json.dumps(js_questions, ensure_ascii=False, indent=2)
-
-        # ── Time: 2 minutes per question, minimum 60 s ────────────────────
         seconds = max(60, len(questions) * 120)
 
-        # ── Replace template placeholders ─────────────────────────────────
         wm_text = watermark if watermark else "RANKUP"
         html = template
         html = html.replace("{quiz_name}",        title)
         html = html.replace("{seconds}",          str(seconds))
         html = html.replace("{questions_array}",  questions_array)
-        # Replace every hardcoded "RANKUP" watermark with the user's brand
         html = html.replace(">RANKUP<",  f">{wm_text}<")
         html = html.replace(">@RANKUP<", f">@{wm_text}<")
 
@@ -915,7 +891,6 @@ def save_quiz_html(questions: list, out_path: str, title: str, watermark: str = 
         return None
 
 
-# Keep old name as alias so nothing breaks if called elsewhere
 def save_quiz_txt(questions: list, out_path: str, title: str, watermark: str = ""):
     return save_quiz_html(questions, out_path, title, watermark)
 
@@ -1008,15 +983,10 @@ def safe_filename(name: str, idx: int = None) -> str:
     return prefix + name
 
 # ══════════════════════════════════════════════════════
-#  FIX 2 — MP4 URL FRESHNESS CHECK
+#  MP4 URL FRESHNESS CHECK
 # ══════════════════════════════════════════════════════
 
 async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
-    """
-    HEAD request to verify a signed CDN URL is still alive before
-    committing a slow downloader. Returns False immediately on 403/404
-    so we don't waste time on all 5 download methods for a dead URL.
-    """
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as s:
@@ -1027,7 +997,6 @@ async def _check_url_fresh(url: str, headers: dict, timeout: int = 8) -> bool:
                 if resp.status in (200, 206):
                     return True
                 if resp.status == 405:
-                    # HEAD not supported — zero-byte GET
                     async with s.get(
                         url, headers=headers, allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=timeout)
@@ -1164,7 +1133,6 @@ async def ytdlp_download(url: str, out_path: str,
     is_proxy = url.startswith(PROXY_BASE)
 
     if _ARIA2C and not is_proxy:
-        # aria2c uses parallel range requests — incompatible with proxy
         ret = await _run(*base_args,
             "--external-downloader", "aria2c",
             "--downloader-args", "aria2c:-x 16 -j 32 -k 1M",
@@ -1208,8 +1176,6 @@ async def download_pdf(url: str, out_path: str):
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(url, headers=PDF_HEADERS,
                                    timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                # Accept any successful response — CDN may return video/mp4
-                # or application/octet-stream as content-type for PDFs
                 if resp.status in (200, 206):
                     data = await resp.read()
                     if len(data) > 512:
@@ -1232,16 +1198,10 @@ async def download_pdf(url: str, out_path: str):
 
 
 async def direct_stream_download(url: str, out_path: str):
-    """
-    FIX 2: aiohttp with 1 MB chunks (up from 64 KB) and a truncation
-    check. Detects expired URLs via 404 mid-stream and returns None
-    immediately rather than saving a corrupt partial file.
-    """
     mp4_hdrs = _mp4_headers(url)
     out      = f"{out_path}.mp4"
 
     try:
-        # Proxy streams full file without range support — need a long sock_read
         sock_read = 1800 if url.startswith(PROXY_BASE) else 90
         connector = aiohttp.TCPConnector(ssl=False, limit=4, keepalive_timeout=60)
         async with aiohttp.ClientSession(connector=connector) as dl_sess:
@@ -1263,7 +1223,6 @@ async def direct_stream_download(url: str, out_path: str):
                 start_t    = time.time()
 
                 async with aiofiles.open(out, "wb") as f:
-                    # 1 MB chunks — fills TCP window properly on fast CDN
                     async for chunk in resp.content.iter_chunked(1048576):
                         await f.write(chunk)
                         downloaded += len(chunk)
@@ -1281,7 +1240,6 @@ async def direct_stream_download(url: str, out_path: str):
                             last_log = now
                 print()
 
-                # Truncation check — discard if we got less than 98% of expected
                 actual = os.path.getsize(out) if os.path.exists(out) else 0
                 if expected and actual < expected * 0.98:
                     print(f"[Direct] Truncated ({actual/(1024*1024):.1f} MB "
@@ -1297,7 +1255,6 @@ async def direct_stream_download(url: str, out_path: str):
         try: os.remove(out)
         except Exception: pass
 
-    # yt-dlp fallback WITH correct headers
     if _YTDLP:
         res = await ytdlp_download(url, out_path, extra_headers=mp4_hdrs)
         if res:
@@ -1317,17 +1274,14 @@ async def _download_single_url(url: str, vtype: str, xor_key: str,
     }
 
     if _is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-        # Always route mp4 URLs through proxy
         proxied    = proxy_mp4_url(url)
         proxy_hdrs = {"User-Agent": MEDIA_UA, "Referer": MEDIA_REFERER}
         print(f"[MP4] Routing through proxy…")
 
-        # Method 1: aiohttp via proxy
         result = await direct_stream_download(proxied, out_path)
         if result:
             return result
 
-        # Method 2: yt-dlp via proxy
         result = await ytdlp_download(proxied, out_path, extra_headers=proxy_hdrs)
         if result:
             return result
@@ -1402,7 +1356,6 @@ async def download_item(title: str, url: str, xor_key: str, vtype: str,
         size = os.path.getsize(result) / (1024 * 1024)
         print(f"[Download] ✓ Saved: {os.path.basename(result)} ({size:.1f} MB)")
 
-    # FIX 1 — download ALL class PDFs, not just the first one
     if want_pdf and class_pdfs:
         for suffix, pdf_url in class_pdfs:
             if not pdf_url:
@@ -1543,11 +1496,6 @@ async def download_test_series(bot_client: Client, m: Message,
                                cname: str = "",
                                auto_all: bool = False,
                                session_credit: str = ""):
-    """
-    Download test series.  auto_all=True skips the pick prompts and
-    downloads every series / subject / test automatically (used by
-    the Download Everything flow — option 6).
-    """
     channel_id = channel_id or m.chat.id
     status = await m.reply_text("⏳ Fetching test series list…")
     series_list = await get_test_series_list(session, api_base, user_id, cid, hdr)
@@ -1685,7 +1633,7 @@ async def download_test_series(bot_client: Client, m: Message,
         )
 
 # ══════════════════════════════════════════════════════
-#  LECTURE DOWNLOAD LOOP  (shared by options 1-4 and 6)
+#  LECTURE DOWNLOAD LOOP
 # ══════════════════════════════════════════════════════
 
 async def run_lecture_loop(
@@ -1708,11 +1656,6 @@ async def run_lecture_loop(
     start_idx: int,
     downloads_dir: str,
 ):
-    """
-    The inner loop that downloads lectures.  Extracted so both the
-    single-mode flow and the Download-Everything flow can share it.
-    Returns (success, failed) counts.
-    """
     success = failed = 0
     total   = len(lectures)
 
@@ -1750,7 +1693,6 @@ async def run_lecture_loop(
         name     = safe_filename(title, i)
         out_path = os.path.join(downloads_dir, name)
 
-        # ── Quiz detection ──────────────────────────────────────────
         QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
         _raw_qid   = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
         _has_quiz  = (
@@ -1785,7 +1727,6 @@ async def run_lecture_loop(
                     "quiz" in mat.lower() and mat.upper() != "VIDEO"):
                 continue
 
-        # ── Resolve URL ─────────────────────────────────────────────
         vtitle, url, xor_key, vtype, class_pdfs, all_candidates = \
             await resolve_video(
                 session, api_base, cid, lec_id, hdr,
@@ -1806,9 +1747,7 @@ async def run_lecture_loop(
             f"Extracted by ➤ {session_credit}"
         )
 
-        # ── FIX 1: handle PDF-type items with ALL attached PDFs ─────
         if vtype == "pdf" and want_pdf:
-            # url is class_pdfs[0] when vtype=="pdf" — download it directly
             pr = await download_pdf(url, out_path)
             if pr:
                 await bot_client.send_document(channel_id, document=pr, caption=cc1)
@@ -1817,7 +1756,6 @@ async def run_lecture_loop(
             else:
                 failed += 1
 
-            # Extra PDFs — class_pdfs here is already extras only (resolve_video strips index 0)
             for idx2, (suffix, purl) in enumerate(class_pdfs, start=2):
                 if not purl:
                     continue
@@ -1836,7 +1774,6 @@ async def run_lecture_loop(
             continue
 
         if vtype not in ("pdf",) and not want_video:
-            # Still send class PDFs even when skipping video
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1847,7 +1784,6 @@ async def run_lecture_loop(
                         os.remove(pr)
             continue
 
-        # ── YouTube ─────────────────────────────────────────────────
         if vtype == "youtube":
             ytf = f"bv*[height<={prefer_quality[:-1]}][ext=mp4]+ba[ext=m4a]/b[height<=?{prefer_quality[:-1]}]"
             cmd = (
@@ -1869,7 +1805,6 @@ async def run_lecture_loop(
             await asyncio.sleep(1)
             continue
 
-        # ── Regular video (HLS / MP4 / encrypted) ───────────────────
         if 'encrypted.m' in (url or ""):
             appxkey  = url.split('*')[1]
             url      = url.split('*')[0]
@@ -1900,7 +1835,6 @@ async def run_lecture_loop(
             await helper.send_vid(
                 bot_client, m, cc, res_file, "/d", name,
                 prog_msg, channel_id, watermark_text=batch_watermark)
-            # FIX 1: also send class PDFs attached to this video lecture
             if want_pdf and class_pdfs:
                 for suffix, purl in class_pdfs:
                     if not purl:
@@ -1911,8 +1845,6 @@ async def run_lecture_loop(
                         os.remove(pr)
             success += 1
         else:
-            # Pass want_pdf=False here so download_item doesn't save PDFs to
-            # disk silently — we'll send them ourselves below after the video.
             ok = await download_item(
                 vtitle or title, url, xor_key, vtype, out_path,
                 hdr=hdr, class_pdfs=[], want_pdf=False,
@@ -1925,7 +1857,6 @@ async def run_lecture_loop(
                             bot_client, m, cc, fpath, "/d", name,
                             prog_msg, channel_id, watermark_text=batch_watermark)
                         break
-                # Send class PDFs that belong to this lecture
                 if want_pdf and class_pdfs:
                     for suffix, purl in class_pdfs:
                         if not purl:
@@ -1940,7 +1871,6 @@ async def run_lecture_loop(
                     channel_id,
                     f"⚠️ **Failed:** `{str(i).zfill(3)}) {title[:60]}`"
                 )
-                # Still try to send PDFs even if video failed
                 if want_pdf and class_pdfs:
                     for suffix, purl in class_pdfs:
                         if not purl:
@@ -1960,7 +1890,6 @@ async def run_lecture_loop(
 # ══════════════════════════════════════════════════════
 
 async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
-    # ── Step 1: API Domain ────────────────────────────────────────────────
     domain_ask = await m.reply_text(
         "**🌐 Enter API Domain**\n\n"
         "<blockquote>Examples:\n"
@@ -1983,7 +1912,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
     api_base = (f"https://{api_raw}" if not api_raw.startswith("http") else api_raw)
 
-    # ── Step 2: Login ─────────────────────────────────────────────────────
     token, appx_user_id, user_name = await appx_login(bot_client, m, api_base)
     if not token:
         return
@@ -1991,7 +1919,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
     hdr = make_headers(token, appx_user_id)
     await m.reply_text(f"✅ **Authenticated as:** `{user_name}`")
 
-    # ── Step 3: Fetch courses ─────────────────────────────────────────────
     status = await m.reply_text("⏳ Fetching your courses…")
     async with aiohttp.ClientSession() as session:
         courses = await get_courses(session, api_base, appx_user_id, hdr)
@@ -2019,7 +1946,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             await m.reply_text(f"**📚 Course: {cname}**")
 
-            # ── Download type ──────────────────────────────────────────────
             dl_type_ask = await m.reply_text(
                 "**What to download?**\n\n"
                 "`1` — Videos only\n"
@@ -2042,11 +1968,8 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             downloads_dir = os.path.join(tempfile.gettempdir(), "downloads")
             os.makedirs(downloads_dir, exist_ok=True)
 
-            # ══════════════════════════════════════════════════════
-            #  OPTION 5 — Test Series only
-            # ══════════════════════════════════════════════════════
+            # ── OPTION 5 — Test Series only ───────────────────────────────
             if dl_choice == "5":
-                # ── Brand name ────────────────────────────────────────────
                 brand_ask = await m.reply_text(
                     "**🏷️ Brand name for captions & HTML watermark?**\n"
                     "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
@@ -2063,7 +1986,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 session_credit = CREDIT if raw_brand == "/d" else raw_brand
                 user_brand_name[user_id_tg] = session_credit
 
-                # ── Watermark ─────────────────────────────────────────────
                 wm_ask = await m.reply_text(
                     "**🖊️ Add watermark text?**\n"
                     "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
@@ -2078,7 +2000,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     await wm_ask.delete()
                 batch_watermark = None if raw_wm == "/d" else raw_wm
 
-                # ── Destination ───────────────────────────────────────────
                 chan_ask = await m.reply_text(
                     "**Upload to channel/group?**\n"
                     "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
@@ -2104,9 +2025,7 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     session_credit=session_credit)
                 continue
 
-            # ══════════════════════════════════════════════════════
-            #  OPTION 6 — Download EVERYTHING automatically
-            # ══════════════════════════════════════════════════════
+            # ── OPTION 6 — Download EVERYTHING ───────────────────────────
             if dl_choice == "6":
                 await m.reply_text(
                     "🔥 **Download EVERYTHING mode**\n\n"
@@ -2116,7 +2035,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     "No further prompts — starting now…"
                 )
 
-                # ── Quality ───────────────────────────────────────────────
                 q_ask = await m.reply_text(
                     "**Video quality?**\n"
                     "`1` 1080p  `2` 720p (default)  `3` 480p\n"
@@ -2133,7 +2051,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     prefer_quality = "720p"
                     await q_ask.delete()
 
-                # ── Brand name ────────────────────────────────────────────
                 brand_ask = await m.reply_text(
                     "**🏷️ Brand name for captions & HTML watermark?**\n"
                     "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
@@ -2150,7 +2067,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 session_credit = CREDIT if raw_brand == "/d" else raw_brand
                 user_brand_name[user_id_tg] = session_credit
 
-                # ── Watermark ─────────────────────────────────────────────
                 wm_ask = await m.reply_text(
                     "**🖊️ Add watermark text?**\n"
                     "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
@@ -2165,7 +2081,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     await wm_ask.delete()
                 batch_watermark = None if raw_wm == "/d" else raw_wm
 
-                # ── Destination ───────────────────────────────────────────
                 chan_ask = await m.reply_text(
                     "**Upload to channel/group?**\n"
                     "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
@@ -2182,7 +2097,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 channel_id = (m.chat.id if "/d" in raw_chan
                               else (int(raw_chan) if raw_chan.lstrip("-").isdigit() else m.chat.id))
 
-                # ── Phase 1: all lectures (video + PDF + quiz) ─────────────
                 await bot_client.send_message(
                     channel_id,
                     f"<blockquote><b>📦 Phase 1/2 — Lectures\nBatch: {cname}</b></blockquote>"
@@ -2240,7 +2154,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                     f"✓ Success: {lec_success}  ✗ Failed: {lec_failed}</blockquote>"
                 )
 
-                # ── Phase 2: all test series ───────────────────────────────
                 if cancel_requested.get(user_id_tg, False):
                     await m.reply_text("🚦 Stopped before Phase 2 (Test Series).")
                 else:
@@ -2266,14 +2179,11 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 )
                 continue
 
-            # ══════════════════════════════════════════════════════
-            #  OPTIONS 1-4 — Lecture-based modes
-            # ══════════════════════════════════════════════════════
+            # ── OPTIONS 1-4 ───────────────────────────────────────────────
             want_video = dl_choice in ("1", "3", "")
             want_pdf   = dl_choice in ("2", "3")
             want_quiz  = dl_choice in ("3", "4")
 
-            # Collect lectures (with subject/topic prompts)
             lec_status = await m.reply_text("⏳ Fetching content…")
             lectures = await collect_all_lectures(
                 bot_client, m, session, api_base, cid, hdr)
@@ -2285,7 +2195,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 
             await m.reply_text(f"✅ Found **{len(lectures)}** lectures")
 
-            # ── Start from ────────────────────────────────────────────────
             start_ask = await m.reply_text(
                 f"**Start from lecture number?** [1-{len(lectures)}, default 1]\n_20s timeout:_"
             )
@@ -2301,7 +2210,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             start_idx = (int(start_raw) - 1) if start_raw.isdigit() else 0
             lectures  = lectures[start_idx:]
 
-            # ── Quality ───────────────────────────────────────────────────
             prefer_quality = "720p"
             if want_video:
                 q_ask = await m.reply_text(
@@ -2319,7 +2227,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 except asyncio.TimeoutError:
                     await q_ask.delete()
 
-            # ── Brand name ────────────────────────────────────────────────
             brand_ask = await m.reply_text(
                 "**🏷️ Brand name for captions & HTML watermark?**\n"
                 "Send your brand/channel name (e.g. `@MyChannel`) or `/d` to use default.\n"
@@ -2336,7 +2243,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
             session_credit = CREDIT if raw_brand == "/d" else raw_brand
             user_brand_name[user_id_tg] = session_credit
 
-            # ── Watermark ─────────────────────────────────────────────────
             wm_ask = await m.reply_text(
                 "**🖊️ Add watermark text?**\n"
                 "Send text (e.g. `@YourChannel`) or `/d` to skip.\n_20s timeout:_"
@@ -2351,7 +2257,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
                 await wm_ask.delete()
             batch_watermark = None if raw_wm == "/d" else raw_wm
 
-            # ── Destination ───────────────────────────────────────────────
             chan_ask = await m.reply_text(
                 "**Upload to channel/group?**\n"
                 "Send Channel ID (e.g. `-100xxxxxxxxxx`) or `/d` to upload here.\n"
@@ -2403,7 +2308,1134 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
     processing_request[user_id_tg] = False
 
 # ══════════════════════════════════════════════════════
-#  STANDARD BOT HANDLERS
+#  SCHEDULER — MONGODB HELPERS
+# ══════════════════════════════════════════════════════
+
+def _aw():
+    """Return the auto_watch MongoDB collection."""
+    return db.db["auto_watch"]
+
+
+def _ensure_scheduler_indexes():
+    try:
+        _aw().create_index(
+            [("user_id", 1), ("auto_id", 1)], unique=True,
+            name="auto_watch_identity"
+        )
+    except Exception:
+        pass
+
+
+def _next_auto_id(user_id: int) -> int | None:
+    used = {doc["auto_id"] for doc in _aw().find({"user_id": user_id}, {"auto_id": 1})}
+    for i in range(1, MAX_AUTOS_PER_USER + 1):
+        if i not in used:
+            return i
+    return None
+
+
+def _get_autos(user_id: int) -> list:
+    return list(_aw().find({"user_id": user_id}, {"_id": 0}).sort("auto_id", 1))
+
+
+def _get_auto(user_id: int, auto_id: int):
+    return _aw().find_one({"user_id": user_id, "auto_id": auto_id}, {"_id": 0})
+
+
+def _save_auto(doc: dict):
+    _aw().update_one(
+        {"user_id": doc["user_id"], "auto_id": doc["auto_id"]},
+        {"$set": doc},
+        upsert=True
+    )
+
+
+def _delete_auto(user_id: int, auto_id: int):
+    _aw().delete_one({"user_id": user_id, "auto_id": auto_id})
+
+# ══════════════════════════════════════════════════════
+#  SCHEDULER — SILENT LOGIN (for token refresh)
+# ══════════════════════════════════════════════════════
+
+async def _fresh_login(session: aiohttp.ClientSession,
+                       api_base: str, phone: str, password: str):
+    """Non-interactive login. Returns (token, appx_uid) or (None, None)."""
+    headers = {**APPX_HEADERS, "content-type": "application/x-www-form-urlencoded"}
+    for endpoint in [
+        f"{api_base}/post/userLogin",
+        f"{api_base}/post/userLogin?extra_details=0",
+        f"{api_base}/api/v2/user/login",
+    ]:
+        try:
+            async with session.post(
+                endpoint, headers=headers,
+                data={"email": phone, "phone": phone,
+                      "password": password, "source": "website",
+                      "extra_details": "1"},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                r = await resp.json(content_type=None)
+                d = r.get("data") or {}
+                token = d.get("token") or r.get("token", "")
+                if token:
+                    uid = str(d.get("userid") or d.get("user_id") or
+                              _extract_user_id_from_jwt(token) or "")
+                    return token, uid
+        except Exception:
+            continue
+    return None, None
+
+
+async def _validate_token(session: aiohttp.ClientSession,
+                           api_base: str, token: str, appx_uid: str) -> bool:
+    hdr = make_headers(token, appx_uid)
+    courses = await get_courses(session, api_base, appx_uid, hdr)
+    return bool(courses)
+
+# ══════════════════════════════════════════════════════
+#  SCHEDULER — SUPERGROUP TOPIC HELPERS
+# ══════════════════════════════════════════════════════
+
+async def _create_topic(supergroup_id: int, subject_name: str):
+    """Create a forum topic. Returns thread_id or None."""
+    try:
+        api_resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
+            json={"chat_id": supergroup_id, "name": f"📚 {subject_name}"}
+        ).json()
+        if api_resp.get("ok"):
+            tid = api_resp["result"]["message_thread_id"]
+            print(f"[Scheduler] Topic created: id={tid} name={subject_name}")
+            return tid
+        else:
+            print(f"[Scheduler] Topic creation failed: {api_resp}")
+            return None
+    except Exception as e:
+        print(f"[Scheduler] Topic creation failed: {e}")
+        return None
+
+
+async def _safe_send(coro):
+    """Wrap a send coroutine with FloodWait + retry."""
+    for attempt in range(5):
+        try:
+            return await coro
+        except FloodWait as fw:
+            print(f"[Scheduler] FloodWait {fw.value}s")
+            await asyncio.sleep(fw.value + 2)
+        except Exception as e:
+            print(f"[Scheduler] Send error: {e}")
+            return None
+    return None
+
+
+async def _send_to_topic(
+        supergroup_id: int,
+        topic_id: int,
+        file_path: str | None,
+        caption: str,
+        is_video: bool = False):
+    """
+    Send a file to a supergroup topic thread.
+    Files ≤ 50 MB  → HTTP Bot API
+    Files  > 50 MB → Pyrogram MTProto
+    """
+    if not file_path or not os.path.exists(file_path):
+        print(f"[Scheduler] File not found: {file_path}")
+        return
+
+    file_size    = os.path.getsize(file_path)
+    use_pyrogram = file_size > 50 * 1024 * 1024
+
+    if use_pyrogram:
+        try:
+            await bot.get_chat(supergroup_id)
+        except Exception:
+            pass
+        if is_video:
+            await _safe_send(bot.send_video(
+                supergroup_id, file_path, caption=caption,
+                reply_to_message_id=topic_id, supports_streaming=True
+            ))
+        else:
+            await _safe_send(bot.send_document(
+                supergroup_id, file_path, caption=caption,
+                reply_to_message_id=topic_id
+            ))
+    else:
+        api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+        method  = "sendVideo"    if is_video else "sendDocument"
+        field   = "video"        if is_video else "document"
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.post(
+                    api_url + method,
+                    data={
+                        "chat_id":            supergroup_id,
+                        "message_thread_id":  topic_id,
+                        "caption":            caption[:1024],
+                        "parse_mode":         "Markdown",
+                        "supports_streaming": "true" if is_video else "false",
+                    },
+                    files={field: f},
+                    timeout=300
+                ).json()
+            if not resp.get("ok"):
+                print(f"[Scheduler] Send error: {resp.get('description')}")
+        except Exception as e:
+            print(f"[Scheduler] Send error: {e}")
+
+# ══════════════════════════════════════════════════════
+#  SCHEDULER — CORE AUTO-UPDATE JOB
+# ══════════════════════════════════════════════════════
+
+async def _run_auto_update(doc: dict):
+    """
+    Process one auto_watch document:
+    - For each subject → fetch new lectures/pdfs/quizzes/tests
+    - Send only NEW items to the correct supergroup topic thread
+    - Save updated seen-ID sets back to MongoDB
+    """
+    user_id     = doc["user_id"]
+    auto_id     = doc["auto_id"]
+    api_base    = doc["api_base"]
+    course_id   = str(doc["course_id"])
+    course_name = doc.get("course_name", "Course")
+    sg_id       = doc["supergroup_id"]
+    brand       = doc.get("brand", CREDIT)
+    subjects    = doc.get("subjects", [])
+
+    phone    = doc.get("phone", "")
+    password = doc.get("password", "")
+    token    = doc.get("appx_token", "")
+    appx_uid = doc.get("appx_user_id", "")
+
+    tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    async with aiohttp.ClientSession() as session:
+
+        # ── Token check / refresh ────────────────────────────────────────
+        token_ok = False
+        if token and appx_uid:
+            token_ok = await _validate_token(session, api_base, token, appx_uid)
+
+        if not token_ok:
+            if phone and password:
+                token, appx_uid = await _fresh_login(session, api_base, phone, password)
+                if token:
+                    token_ok = True
+                    _aw().update_one(
+                        {"user_id": user_id, "auto_id": auto_id},
+                        {"$set": {"appx_token": token, "appx_user_id": appx_uid}}
+                    )
+
+            if not token_ok:
+                print(f"[Scheduler] Token expired and re-login failed for user {user_id} auto #{auto_id}")
+                _aw().update_one(
+                    {"user_id": user_id, "auto_id": auto_id},
+                    {"$set": {"is_active": False}}
+                )
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ **Auto #{auto_id} — Login Failed!**\n\n"
+                        f"Could not log in to `{api_base}`.\n"
+                        f"Auto #{auto_id} has been **paused**.\n"
+                        f"Use /addauto to create a new one."
+                    )
+                except Exception:
+                    pass
+                return
+
+        hdr = make_headers(token, appx_uid)
+        updated_subjects = []
+
+        for subj in subjects:
+            subj_id    = str(subj["subject_id"])
+            subj_name  = subj["subject_name"]
+            topic_id   = subj.get("topic_thread_id")
+
+            track_lec   = subj.get("track_lectures",  True)
+            track_pdf   = subj.get("track_pdfs",      True)
+            track_quiz  = subj.get("track_quizzes",   True)
+            track_tests = subj.get("track_tests",     True)
+
+            seen_lec_ids  = set(subj.get("last_lecture_ids", []))
+            seen_pdf_ids  = set(subj.get("last_pdf_ids",     []))
+            seen_quiz_ids = set(subj.get("last_quiz_ids",    []))
+            seen_test_ids = set(subj.get("last_test_ids",    []))
+
+            new_lec_ids  = set()
+            new_pdf_ids  = set()
+            new_quiz_ids = set()
+            new_test_ids = set()
+
+            if not topic_id:
+                print(f"[Scheduler] No topic_thread_id for subject '{subj_name}' in auto #{auto_id} — skipping")
+                updated_subjects.append(subj)
+                continue
+
+            appx_topics = await get_topics(session, api_base, course_id, subj_id, hdr)
+
+            for appx_topic in appx_topics:
+                appx_topic_id   = str(appx_topic.get("topicid", ""))
+                appx_topic_name = appx_topic.get("topic_name", "")
+                lectures        = await get_lectures(
+                    session, api_base, course_id, subj_id, appx_topic_id, hdr
+                )
+
+                for lec in lectures:
+                    lec_id    = str(lec.get("id", ""))
+                    lec_title = lec.get("Title") or lec.get("title") or f"Lecture_{lec_id}"
+                    mat       = lec.get("material_type", "")
+
+                    if not lec_id:
+                        continue
+
+                    QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
+                    raw_qid  = str(lec.get("quiz_title_id") or
+                                   lec.get("quizid") or
+                                   lec.get("quiz_id") or "")
+                    has_quiz = (
+                        mat.upper() in QUIZ_TYPES
+                        or "quiz" in mat.lower()
+                        or (raw_qid not in ("", "0", "-1", "None"))
+                    )
+
+                    # ── NEW QUIZ ─────────────────────────────────────────
+                    if has_quiz and track_quiz and raw_qid and raw_qid not in seen_quiz_ids:
+                        new_quiz_ids.add(raw_qid)
+                        questions = await fetch_quiz(session, api_base, raw_qid, appx_uid, hdr)
+                        if questions:
+                            quiz_path = os.path.join(tmp_dir, f"quiz_{raw_qid}.html")
+                            save_quiz_html(questions, quiz_path, lec_title, watermark=brand)
+                            if os.path.exists(quiz_path):
+                                cap = (
+                                    f"📝 **New Quiz — {subj_name}**\n\n"
+                                    f"❓ `{lec_title[:60]}`\n"
+                                    f"📌 Topic: {appx_topic_name}\n"
+                                    f"🔢 {len(questions)} Questions\n"
+                                    f"🤖 Auto #{auto_id} | {brand}"
+                                )
+                                await _send_to_topic(sg_id, topic_id, quiz_path, cap, is_video=False)
+                                try:
+                                    os.remove(quiz_path)
+                                except Exception:
+                                    pass
+
+                        if mat.upper() in QUIZ_TYPES or (
+                                "quiz" in mat.lower() and mat.upper() != "VIDEO"):
+                            continue
+
+                    # ── Resolve video / PDF URL ──────────────────────────
+                    vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
+                        await resolve_video(session, api_base, course_id, lec_id, hdr)
+
+                    # ── NEW PDF-type lecture ──────────────────────────────
+                    if vtype == "pdf" and track_pdf and lec_id not in seen_pdf_ids:
+                        new_pdf_ids.add(lec_id)
+                        if url:
+                            pdf_path = os.path.join(tmp_dir, f"pdf_{lec_id}.pdf")
+                            result   = await download_pdf(url, pdf_path)
+                            if result and os.path.exists(result):
+                                cap = (
+                                    f"📄 **New PDF — {subj_name}**\n\n"
+                                    f"📝 `{lec_title[:60]}`\n"
+                                    f"📌 Topic: {appx_topic_name}\n"
+                                    f"🤖 Auto #{auto_id} | {brand}"
+                                )
+                                await _send_to_topic(sg_id, topic_id, result, cap, is_video=False)
+                                try:
+                                    os.remove(result)
+                                except Exception:
+                                    pass
+                        for suffix, purl in class_pdfs:
+                            if not purl:
+                                continue
+                            pid     = f"pdf_{lec_id}{suffix}"
+                            ppath   = os.path.join(tmp_dir, f"{pid}.pdf")
+                            result2 = await download_pdf(purl, ppath)
+                            if result2 and os.path.exists(result2):
+                                cap2 = (
+                                    f"📄 **New PDF — {subj_name}**\n\n"
+                                    f"📝 `{lec_title[:55]} {suffix}`\n"
+                                    f"📌 Topic: {appx_topic_name}\n"
+                                    f"🤖 Auto #{auto_id} | {brand}"
+                                )
+                                await _send_to_topic(sg_id, topic_id, result2, cap2, is_video=False)
+                                try:
+                                    os.remove(result2)
+                                except Exception:
+                                    pass
+                        continue
+
+                    # ── PDFs attached to a VIDEO lecture ──────────────────
+                    if track_pdf and class_pdfs:
+                        for suffix, purl in class_pdfs:
+                            if not purl:
+                                continue
+                            pid = f"pdf_{lec_id}{suffix}"
+                            if pid in seen_pdf_ids:
+                                continue
+                            new_pdf_ids.add(pid)
+                            ppath   = os.path.join(tmp_dir, f"{pid}.pdf")
+                            result3 = await download_pdf(purl, ppath)
+                            if result3 and os.path.exists(result3):
+                                cap3 = (
+                                    f"📄 **New PDF — {subj_name}**\n\n"
+                                    f"📝 `{lec_title[:55]} {suffix}`\n"
+                                    f"📌 Topic: {appx_topic_name}\n"
+                                    f"🤖 Auto #{auto_id} | {brand}"
+                                )
+                                await _send_to_topic(sg_id, topic_id, result3, cap3, is_video=False)
+                                try:
+                                    os.remove(result3)
+                                except Exception:
+                                    pass
+
+                    # ── NEW VIDEO LECTURE ────────────────────────────────
+                    if track_lec and lec_id not in seen_lec_ids and url:
+                        new_lec_ids.add(lec_id)
+                        out_path = os.path.join(tmp_dir, f"lec_{lec_id}")
+                        ok = await download_item(
+                            lec_title, url, xor_key, vtype,
+                            out_path, hdr=hdr,
+                            class_pdfs=[], want_pdf=False,
+                            all_candidates=all_cands
+                        )
+                        if ok:
+                            vid_file = None
+                            for ext in ("mp4", "mkv", "webm", "ts"):
+                                fp = f"{out_path}.{ext}"
+                                if os.path.exists(fp):
+                                    vid_file = fp
+                                    break
+                            if vid_file:
+                                cap = (
+                                    f"📹 **New Lecture — {subj_name}**\n\n"
+                                    f"`{lec_title[:60]}`\n"
+                                    f"📌 Topic: {appx_topic_name}\n"
+                                    f"🤖 Auto #{auto_id} | {brand}"
+                                )
+                                await _send_to_topic(sg_id, topic_id, vid_file, cap, is_video=True)
+                                try:
+                                    os.remove(vid_file)
+                                except Exception:
+                                    pass
+
+                    await asyncio.sleep(0.5)
+
+            # ── TEST SERIES for this subject ─────────────────────────────
+            if track_tests:
+                ts_list = await get_test_series_list(
+                    session, api_base, appx_uid, course_id, hdr
+                )
+
+                for ts in ts_list:
+                    series_id   = str(ts.get("id") or ts.get("test_series_id", ""))
+                    series_name = ts.get("title") or ts.get("name") or f"Series_{series_id}"
+                    if not series_id:
+                        continue
+
+                    ts_topic_map = subj.setdefault("ts_topic_map", {})
+                    ts_thread_id = ts_topic_map.get(series_id)
+
+                    if not ts_thread_id:
+                        ts_thread_id = await _create_topic(
+                            sg_id, f"{subj_name} — {series_name}"
+                        )
+                        if ts_thread_id:
+                            ts_topic_map[series_id] = ts_thread_id
+                            _aw().update_one(
+                                {"user_id": user_id, "auto_id": auto_id,
+                                 "subjects.subject_id": subj_id},
+                                {"$set": {
+                                    f"subjects.$.ts_topic_map.{series_id}": ts_thread_id
+                                }}
+                            )
+                            await asyncio.sleep(0.5)
+                        else:
+                            ts_thread_id = topic_id
+
+                    ts_subjects = await get_testseries_subjects(
+                        session, api_base, series_id, hdr
+                    )
+
+                    matched_ts_subj = None
+                    for ts_subj in ts_subjects:
+                        ts_sid   = str(ts_subj.get("id") or ts_subj.get("subject_id") or ts_subj.get("subjectid", ""))
+                        ts_sname = (ts_subj.get("subject_name") or ts_subj.get("name") or "").lower()
+                        if ts_sid == subj_id:
+                            matched_ts_subj = ts_subj
+                            break
+                        if subj_name.lower() in ts_sname or ts_sname in subj_name.lower():
+                            matched_ts_subj = ts_subj
+                            break
+
+                    if not matched_ts_subj and ts_subjects:
+                        for ts_subj in ts_subjects:
+                            ts_sid = str(ts_subj.get("id") or ts_subj.get("subjectid") or ts_subj.get("subject_id", "0"))
+                            if ts_sid in ("0", ""):
+                                matched_ts_subj = ts_subj
+                                break
+
+                    if not matched_ts_subj:
+                        continue
+
+                    matched_sid = str(matched_ts_subj.get("id") or
+                                      matched_ts_subj.get("subjectid") or
+                                      matched_ts_subj.get("subject_id", "0"))
+
+                    tests = await get_testseries_tests(
+                        session, api_base, series_id, matched_sid, hdr
+                    )
+
+                    for test in tests:
+                        test_id    = str(test.get("id") or test.get("test_id", ""))
+                        test_title = (test.get("title") or test.get("test_title") or f"Test_{test_id}")
+                        if not test_id or test_id in seen_test_ids:
+                            continue
+                        new_test_ids.add(test_id)
+
+                        questions = await fetch_testseries_questions(session, api_base, test, hdr)
+                        if not questions:
+                            continue
+
+                        tpath = os.path.join(tmp_dir, f"test_{test_id}.html")
+                        save_quiz_html(questions, tpath, test_title, watermark=brand)
+                        if os.path.exists(tpath):
+                            marks = test.get("marks") or test.get("total_marks") or ""
+                            mins  = test.get("time")  or test.get("duration")    or ""
+                            meta  = []
+                            if marks: meta.append(f"{marks} marks")
+                            if mins:  meta.append(f"{mins} min")
+                            meta_str = f" `[{', '.join(meta)}]`" if meta else ""
+
+                            cap = (
+                                f"📋 **New Test — {subj_name}**\n\n"
+                                f"🗂️ Series: {series_name}\n"
+                                f"📊 `{test_title[:55]}`{meta_str}\n"
+                                f"🔢 {len(questions)} Questions\n"
+                                f"🤖 Auto #{auto_id} | {brand}"
+                            )
+                            await _send_to_topic(sg_id, ts_thread_id, tpath, cap, is_video=False)
+                            try:
+                                os.remove(tpath)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(0.3)
+
+            # ── Persist updated seen-ID sets ─────────────────────────────
+            subj["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
+            subj["last_pdf_ids"]     = list(seen_pdf_ids | new_pdf_ids)
+            subj["last_quiz_ids"]    = list(seen_quiz_ids | new_quiz_ids)
+            subj["last_test_ids"]    = list(seen_test_ids | new_test_ids)
+            updated_subjects.append(subj)
+
+        # ── Save updated state ───────────────────────────────────────────
+        _aw().update_one(
+            {"user_id": user_id, "auto_id": auto_id},
+            {"$set": {
+                "subjects":    updated_subjects,
+                "last_run_at": datetime.utcnow()
+            }}
+        )
+        print(f"[Scheduler] ✅ Auto #{auto_id} for user {user_id} done.")
+
+
+async def run_all_due_autos():
+    """Called every minute by APScheduler. Fires autos whose IST HH:MM matches now."""
+    now_ist = datetime.now(IST).strftime("%H:%M")
+    due = list(_aw().find({"check_time_ist": now_ist, "is_active": True}))
+    if not due:
+        return
+    print(f"[Scheduler] {len(due)} auto(s) due at {now_ist} IST")
+    for doc in due:
+        try:
+            await _run_auto_update(doc)
+        except Exception as e:
+            print(f"[Scheduler] Error in auto #{doc.get('auto_id')}: {e}")
+
+# ══════════════════════════════════════════════════════
+#  /addauto COMMAND
+# ══════════════════════════════════════════════════════
+
+@bot.on_message(filters.command("addauto") & filters.private)
+async def addauto_handler(bot_client: Client, m: Message):
+    uid = m.from_user.id
+
+    bot_info = await bot_client.get_me()
+    if not db.is_user_authorized(uid, bot_info.username):
+        await m.reply_text(
+            f"<blockquote>❌ **Access Denied!**\n"
+            f"You are not a Premium member.\n"
+            f"Your User ID: `{uid}`</blockquote>"
+        )
+        return
+
+    if _aw().count_documents({"user_id": uid}) >= MAX_AUTOS_PER_USER:
+        await m.reply_text(
+            f"❌ You have reached the **{MAX_AUTOS_PER_USER} auto-updates** limit.\n"
+            "Use /delauto to remove one first."
+        )
+        return
+
+    auto_id = _next_auto_id(uid)
+    if auto_id is None:
+        await m.reply_text("❌ No auto-ID available. Use /delauto to free one.")
+        return
+
+    # ── Step 1: API Domain ───────────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🔧 Auto-Setup — Step 1/7**\n\n"
+        "🌐 **Enter your AppX API domain:**\n"
+        "<blockquote>e.g. `parmaracademyapi.teachx.in`\n"
+        "Send without `https://`\n\n"
+        "Send /cancel to abort.</blockquote>"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=120)
+    except Exception:
+        await ask.edit_text("⏰ Timed out. Use /addauto again.")
+        return
+    if (msg.text or "").strip() == "/cancel":
+        await m.reply_text("❌ Cancelled.")
+        return
+    raw_domain = (msg.text or "").strip()
+    await msg.delete(); await ask.delete()
+    api_base = f"https://{raw_domain}" if not raw_domain.startswith("http") else raw_domain
+
+    # ── Step 2: Login method ─────────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🔧 Auto-Setup — Step 2/7**\n\n"
+        "🔐 **Login method:**\n\n"
+        "`1` — Phone/Email + Password _(recommended — auto-refreshes token)_\n"
+        "`2` — JWT Token only\n\n"
+        "Send `1` or `2`:"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out.")
+        return
+    login_choice = (msg.text or "").strip()
+    await msg.delete(); await ask.delete()
+
+    phone = password = token = appx_uid = ""
+
+    if login_choice == "2":
+        ask = await m.reply_text("**Send your JWT Token:**")
+        try:
+            msg = await bot_client.listen(m.chat.id, timeout=120)
+        except Exception:
+            await ask.edit_text("⏰ Timed out."); return
+        token = (msg.text or "").strip()
+        await msg.delete(); await ask.delete()
+        appx_uid = str(_extract_user_id_from_jwt(token) or "")
+        if not appx_uid:
+            ask2 = await m.reply_text("⚠️ Could not extract User ID. Send it manually:")
+            try:
+                msg2 = await bot_client.listen(m.chat.id, timeout=60)
+                appx_uid = (msg2.text or "").strip()
+                await msg2.delete(); await ask2.delete()
+            except Exception:
+                await ask2.edit_text("⏰ Timed out."); return
+    else:
+        ask = await m.reply_text(
+            "**🔧 Step 2a/7 — Phone / Email:**\n"
+            "Send your registered phone or email:"
+        )
+        try:
+            msg = await bot_client.listen(m.chat.id, timeout=120)
+        except Exception:
+            await ask.edit_text("⏰ Timed out."); return
+        phone = (msg.text or "").strip()
+        await msg.delete(); await ask.delete()
+
+        ask = await m.reply_text("**🔧 Step 2b/7 — Password:**")
+        try:
+            msg = await bot_client.listen(m.chat.id, timeout=120)
+        except Exception:
+            await ask.edit_text("⏰ Timed out."); return
+        password = (msg.text or "").strip()
+        await msg.delete(); await ask.delete()
+
+        wait = await m.reply_text("⏳ Logging in…")
+        async with aiohttp.ClientSession() as session:
+            token, appx_uid = await _fresh_login(session, api_base, phone, password)
+        if not token:
+            await wait.edit_text(
+                "❌ **Login failed.** Check credentials and try /addauto again."
+            )
+            return
+        await wait.edit_text("✅ Login successful!")
+
+    # ── Fetch courses ────────────────────────────────────────────────────
+    wait = await m.reply_text("⏳ Fetching your courses…")
+    async with aiohttp.ClientSession() as session:
+        hdr     = make_headers(token, appx_uid)
+        courses = await get_courses(session, api_base, appx_uid, hdr)
+
+    if not courses:
+        await wait.edit_text(
+            "❌ **No courses found or token is invalid.**\n"
+            "Try /addauto again with correct credentials."
+        )
+        return
+
+    # ── Step 3: Select course ────────────────────────────────────────────
+    course_text = "**📚 Auto-Setup — Step 3/7 — Select Course**\n\nYour courses:\n\n"
+    for i, c in enumerate(courses[:20], 1):
+        name = c.get("course_name") or c.get("title") or f"Course {i}"
+        course_text += f"`{i}.` {name}\n"
+    course_text += "\n**Send the course number:**"
+    await wait.edit_text(course_text)
+
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await m.reply_text("⏰ Timed out."); return
+    try:
+        ci     = int((msg.text or "").strip()) - 1
+        assert 0 <= ci < len(courses)
+    except Exception:
+        await m.reply_text("❌ Invalid selection. Use /addauto again."); return
+    await msg.delete()
+
+    chosen_course = courses[ci]
+    course_id     = str(chosen_course.get("id") or chosen_course.get("courseid", ""))
+    course_name   = chosen_course.get("course_name") or chosen_course.get("title", "")
+
+    # ── Step 4: Select subjects ──────────────────────────────────────────
+    wait = await m.reply_text("⏳ Fetching subjects…")
+    async with aiohttp.ClientSession() as session:
+        hdr          = make_headers(token, appx_uid)
+        subjects_raw = await get_subjects(session, api_base, course_id, hdr)
+
+    if not subjects_raw:
+        await wait.edit_text("❌ No subjects found for this course."); return
+
+    subj_text = "**📖 Auto-Setup — Step 4/7 — Select Subjects**\n\nAvailable subjects:\n\n"
+    for i, s in enumerate(subjects_raw[:30], 1):
+        sname = s.get("subject_name") or s.get("name") or f"Subject {i}"
+        subj_text += f"`{i}.` {sname}\n"
+    subj_text += (
+        "\n**Send subject numbers separated by commas.**\n"
+        "_Example: `1,3,5` or `all` for all subjects_"
+    )
+    await wait.edit_text(subj_text)
+
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=120)
+    except Exception:
+        await m.reply_text("⏰ Timed out."); return
+    raw_in = (msg.text or "").strip().lower()
+    await msg.delete()
+    if raw_in == "all":
+        chosen_subjects = subjects_raw[:30]
+    else:
+        try:
+            idxs            = [int(x.strip()) - 1 for x in raw_in.split(",")]
+            chosen_subjects = [subjects_raw[i] for i in idxs if 0 <= i < len(subjects_raw)]
+        except Exception:
+            await m.reply_text("❌ Invalid selection. Use /addauto again."); return
+    if not chosen_subjects:
+        await m.reply_text("❌ No valid subjects selected."); return
+
+    # ── Step 5: What to track ────────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🔍 Auto-Setup — Step 5/7 — What to Track**\n\n"
+        "`1` 📹 Lectures (videos)\n"
+        "`2` 📄 PDFs\n"
+        "`3` 📝 Lecture Quizzes\n"
+        "`4` 📋 Test Series\n\n"
+        "_Send numbers separated by commas._\n"
+        "_e.g. `2,3` for PDFs + Quizzes | `1,2,3,4` for everything_\n\n"
+        "<blockquote>📌 Test Series (`4`) automatically creates a separate "
+        "topic thread per series inside the supergroup.</blockquote>"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out."); return
+    track_nums = set()
+    for x in (msg.text or "").split(","):
+        try:
+            track_nums.add(int(x.strip()))
+        except Exception:
+            pass
+    await msg.delete(); await ask.delete()
+
+    track_lec   = 1 in track_nums
+    track_pdf   = 2 in track_nums
+    track_quiz  = 3 in track_nums
+    track_tests = 4 in track_nums
+
+    if not any([track_lec, track_pdf, track_quiz, track_tests]):
+        await m.reply_text("❌ Nothing selected to track. Use /addauto again."); return
+
+    # ── Step 6: Brand name ───────────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🏷️ Auto-Setup — Step 6/7 — Brand Name**\n\n"
+        "Send your channel name / watermark for captions\n"
+        "_(e.g. `@MyChannel`)_\n"
+        "or `/d` to use default:"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=30)
+        raw_brand = (msg.text or "").strip()
+        brand = CREDIT if raw_brand == "/d" else raw_brand
+        await msg.delete(); await ask.delete()
+    except Exception:
+        brand = CREDIT
+        await ask.delete()
+
+    # ── Step 7a: Supergroup ID ───────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🏠 Auto-Setup — Step 7a/7 — Supergroup ID**\n\n"
+        "Send the **Supergroup ID** with Topics enabled.\n"
+        "<blockquote>e.g. `-1001234567890`\n\n"
+        "✅ Make sure the bot is **admin** with\n"
+        "   **Manage Topics** permission in that group.</blockquote>"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out."); return
+    try:
+        sg_id = int((msg.text or "").strip())
+    except Exception:
+        await m.reply_text("❌ Invalid Supergroup ID."); return
+    await msg.delete(); await ask.delete()
+
+    # ── Step 7b: Schedule time ───────────────────────────────────────────
+    ask = await m.reply_text(
+        "**🕒 Auto-Setup — Step 7b/7 — Schedule Time (IST)**\n\n"
+        "What time should I check for new content daily?\n"
+        "<blockquote>Send in **HH:MM** 24-hour IST format\n"
+        "e.g. `08:00` → 8 AM | `20:30` → 8:30 PM</blockquote>"
+    )
+    try:
+        msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out."); return
+    time_input = (msg.text or "").strip()
+    await msg.delete(); await ask.delete()
+
+    if not re.match(r"^\d{2}:\d{2}$", time_input):
+        await m.reply_text("❌ Invalid time. Use HH:MM like `09:00`. Try /addauto again.")
+        return
+    h, mi = map(int, time_input.split(":"))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        await m.reply_text("❌ Invalid time values. Use /addauto again."); return
+
+    # ── Create supergroup topics ─────────────────────────────────────────
+    creating = await m.reply_text(
+        f"⏳ Creating **{len(chosen_subjects)}** topic(s) in your supergroup…"
+    )
+    subjects_docs = []
+    failed_topics = []
+
+    for s in chosen_subjects:
+        sname = s.get("subject_name") or s.get("name") or "Subject"
+        sid   = str(s.get("id") or s.get("subjectid") or s.get("subject_id", ""))
+        tid   = await _create_topic(sg_id, sname)
+        if tid is None:
+            failed_topics.append(sname)
+            continue
+        subjects_docs.append({
+            "subject_id":       sid,
+            "subject_name":     sname,
+            "topic_thread_id":  tid,
+            "track_lectures":   track_lec,
+            "track_pdfs":       track_pdf,
+            "track_quizzes":    track_quiz,
+            "track_tests":      track_tests,
+            "last_lecture_ids": [],
+            "last_pdf_ids":     [],
+            "last_quiz_ids":    [],
+            "last_test_ids":    []
+        })
+        await asyncio.sleep(0.5)
+
+    if not subjects_docs:
+        await creating.edit_text(
+            "❌ Could not create any topics.\n"
+            "Make sure the bot is **admin** with **Manage Topics** permission."
+        )
+        return
+
+    # ── Save to MongoDB ──────────────────────────────────────────────────
+    doc = {
+        "user_id":        uid,
+        "auto_id":        auto_id,
+        "api_base":       api_base,
+        "course_id":      course_id,
+        "course_name":    course_name,
+        "appx_token":     token,
+        "appx_user_id":   appx_uid,
+        "phone":          phone,
+        "password":       password,
+        "supergroup_id":  sg_id,
+        "check_time_ist": time_input,
+        "brand":          brand,
+        "subjects":       subjects_docs,
+        "is_active":      True,
+        "added_at":       datetime.utcnow(),
+        "last_run_at":    None
+    }
+    _save_auto(doc)
+
+    track_labels = []
+    if track_lec:   track_labels.append("📹 Lectures")
+    if track_pdf:   track_labels.append("📄 PDFs")
+    if track_quiz:  track_labels.append("📝 Quizzes")
+    if track_tests: track_labels.append("📋 Tests")
+
+    result_text = (
+        f"✅ **Auto #{auto_id} Created!**\n\n"
+        f"📚 **Course:** {course_name}\n"
+        f"📖 **Subjects:** {len(subjects_docs)} topic(s) created\n"
+        f"🔍 **Tracking:** {' | '.join(track_labels)}\n"
+        f"🕒 **Daily at:** `{time_input}` IST\n"
+        f"🏠 **Supergroup:** `{sg_id}`\n"
+        f"🏷️ **Brand:** `{brand}`\n"
+    )
+    if failed_topics:
+        result_text += f"\n⚠️ Topic creation failed for: {', '.join(failed_topics)}"
+    result_text += (
+        f"\n\n**Commands:**\n"
+        f"/myautos — view all autos\n"
+        f"/runnow {auto_id} — run immediately\n"
+        f"/delauto — delete an auto"
+    )
+    await creating.edit_text(result_text)
+
+# ══════════════════════════════════════════════════════
+#  /myautos COMMAND
+# ══════════════════════════════════════════════════════
+
+@bot.on_message(filters.command("myautos") & filters.private)
+async def myautos_handler(bot_client: Client, m: Message):
+    uid   = m.from_user.id
+    autos = _get_autos(uid)
+
+    if not autos:
+        await m.reply_text(
+            "📋 **No auto-updates configured yet.**\n\n"
+            "Use /addauto to set one up!"
+        )
+        return
+
+    text = f"📋 **Your Auto-Updates ({len(autos)}/{MAX_AUTOS_PER_USER})**\n\n"
+    for doc in autos:
+        subjects   = doc.get("subjects", [])
+        subj_names = [s["subject_name"] for s in subjects]
+        tracks     = []
+        if subjects:
+            s0 = subjects[0]
+            if s0.get("track_lectures"):  tracks.append("📹 Lec")
+            if s0.get("track_pdfs"):      tracks.append("📄 PDF")
+            if s0.get("track_quizzes"):   tracks.append("📝 Quiz")
+            if s0.get("track_tests"):     tracks.append("📋 Test")
+
+        status   = "🟢 Active" if doc.get("is_active") else "🔴 Paused"
+        last_run = doc.get("last_run_at")
+        last_str = (last_run.strftime("%d %b %H:%M UTC")
+                    if isinstance(last_run, datetime) else "Never")
+
+        text += (
+            f"**#{doc['auto_id']} — {doc['course_name']}**\n"
+            f"  🌐 `{doc.get('api_base','?')}`\n"
+            f"  📖 {', '.join(subj_names[:4])}{'…' if len(subj_names) > 4 else ''}\n"
+            f"  🔍 {' + '.join(tracks) if tracks else 'Nothing'}\n"
+            f"  🕒 `{doc.get('check_time_ist','?')}` IST | {status}\n"
+            f"  🏠 `{doc.get('supergroup_id','?')}`\n"
+            f"  ⏱️ Last run: {last_str}\n\n"
+        )
+
+    text += "_Use /runnow <id> to trigger now | /delauto to remove_"
+    await m.reply_text(text)
+
+# ══════════════════════════════════════════════════════
+#  /runnow COMMAND
+# ══════════════════════════════════════════════════════
+
+@bot.on_message(filters.command("runnow") & filters.private)
+async def runnow_handler(bot_client: Client, m: Message):
+    uid  = m.from_user.id
+
+    bot_info = await bot_client.get_me()
+    if not db.is_user_authorized(uid, bot_info.username):
+        await m.reply_text(
+            f"<blockquote>❌ **Access Denied!**\nYour User ID: `{uid}`</blockquote>"
+        )
+        return
+
+    args = m.text.split()
+    auto_id = None
+    if len(args) > 1:
+        try:
+            auto_id = int(args[1])
+        except Exception:
+            pass
+
+    if auto_id is None:
+        autos = _get_autos(uid)
+        if not autos:
+            await m.reply_text("❌ No autos configured. Use /addauto first.")
+            return
+        if len(autos) == 1:
+            auto_id = autos[0]["auto_id"]
+        else:
+            list_text = "**Which auto do you want to run?**\n\n"
+            for a in autos:
+                list_text += f"`{a['auto_id']}.` {a['course_name']} | {a.get('check_time_ist','?')} IST\n"
+            list_text += "\nSend the auto number:"
+            ask = await m.reply_text(list_text)
+            try:
+                msg = await bot_client.listen(m.chat.id, timeout=30)
+                auto_id = int((msg.text or "").strip())
+                await msg.delete(); await ask.delete()
+            except Exception:
+                await ask.edit_text("⏰ Timed out / invalid."); return
+
+    doc = _get_auto(uid, auto_id)
+    if not doc:
+        await m.reply_text(f"❌ Auto #{auto_id} not found.")
+        return
+
+    await m.reply_text(
+        f"🚀 **Running Auto #{auto_id} — {doc['course_name']} now…**\n"
+        "You'll receive updates as new content is found."
+    )
+    asyncio.create_task(_run_auto_update(doc))
+
+# ══════════════════════════════════════════════════════
+#  /delauto COMMAND
+# ══════════════════════════════════════════════════════
+
+@bot.on_message(filters.command("delauto") & filters.private)
+async def delauto_handler(bot_client: Client, m: Message):
+    uid   = m.from_user.id
+    autos = _get_autos(uid)
+
+    if not autos:
+        await m.reply_text("📋 You have no auto-updates to delete.")
+        return
+
+    text = "🗑️ **Delete Auto-Update**\n\nYour autos:\n\n"
+    for doc in autos:
+        text += (
+            f"`{doc['auto_id']}.` **{doc['course_name']}** "
+            f"| `{doc.get('check_time_ist','?')}` IST\n"
+        )
+    text += "\n**Send the auto number to delete:**"
+    await m.reply_text(text)
+
+    try:
+        pick = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await m.reply_text("⏰ Timed out."); return
+    try:
+        auto_id = int((pick.text or "").strip())
+    except Exception:
+        await m.reply_text("❌ Invalid number."); return
+
+    doc = _get_auto(uid, auto_id)
+    if not doc:
+        await m.reply_text(f"❌ Auto #{auto_id} not found."); return
+
+    ask = await m.reply_text(
+        f"**Delete Auto #{auto_id} — {doc['course_name']}**\n\n"
+        "`1` — Delete entire auto (removes all supergroup topics)\n"
+        "`2` — Remove specific subjects only\n\n"
+        "**Send 1 or 2:**"
+    )
+    try:
+        choice_msg = await bot_client.listen(m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out."); return
+    choice = (choice_msg.text or "").strip()
+    await choice_msg.delete(); await ask.delete()
+
+    if choice == "1":
+        sg_id    = doc.get("supergroup_id")
+        subjects = doc.get("subjects", [])
+        removed  = 0
+        for s in subjects:
+            tid = s.get("topic_thread_id")
+            if tid and sg_id:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
+                        json={"chat_id": sg_id, "message_thread_id": tid}
+                    )
+                    removed += 1
+                except Exception:
+                    pass
+        _delete_auto(uid, auto_id)
+        await m.reply_text(
+            f"✅ **Auto #{auto_id} deleted.**\n"
+            f"🗑️ Removed {removed} supergroup topic(s)."
+        )
+
+    elif choice == "2":
+        subjects  = doc.get("subjects", [])
+        subj_text = "**Select subjects to remove:**\n\n"
+        for i, s in enumerate(subjects, 1):
+            subj_text += f"`{i}.` {s['subject_name']}\n"
+        subj_text += "\n_Send numbers separated by commas (e.g. `1,3`)_"
+        await m.reply_text(subj_text)
+
+        try:
+            subj_pick = await bot_client.listen(m.chat.id, timeout=60)
+        except Exception:
+            await m.reply_text("⏰ Timed out."); return
+        try:
+            rm_idxs = [int(x.strip()) - 1 for x in (subj_pick.text or "").split(",")]
+        except Exception:
+            await m.reply_text("❌ Invalid input."); return
+
+        sg_id         = doc.get("supergroup_id")
+        removed_names = []
+        kept_subjects = []
+
+        for i, s in enumerate(subjects):
+            if i in rm_idxs:
+                tid = s.get("topic_thread_id")
+                if tid and sg_id:
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
+                            json={"chat_id": sg_id, "message_thread_id": tid}
+                        )
+                    except Exception:
+                        pass
+                removed_names.append(s["subject_name"])
+            else:
+                kept_subjects.append(s)
+
+        if not kept_subjects:
+            _delete_auto(uid, auto_id)
+            await m.reply_text(
+                f"✅ All subjects removed — **Auto #{auto_id} fully deleted.**"
+            )
+        else:
+            _aw().update_one(
+                {"user_id": uid, "auto_id": auto_id},
+                {"$set": {"subjects": kept_subjects}}
+            )
+            await m.reply_text(
+                f"✅ Removed: {', '.join(removed_names)}\n"
+                f"📖 Remaining subjects: {len(kept_subjects)}"
+            )
+    else:
+        await m.reply_text("❌ Invalid choice. Use /delauto again.")
+
+# ══════════════════════════════════════════════════════
+#  STANDARD BOT HANDLERS  (unchanged from original)
 # ══════════════════════════════════════════════════════
 
 m_file_path = "main.py"
@@ -2637,14 +3669,13 @@ async def cmd_callback(client, cq):
         f"➥ /info — Your Telegram info\n"
         f"➥ /logs — View bot logs\n"
         f"➥ /cookies — Update YouTube cookies\n\n"
-        f"{'▰'*16}\n"
-        f"Owner commands: /addauth /rmauth /users /broadcast /reset\n\n"
-        f"{'▰'*16}\n"
-        f"**🤖 Auto-Update**\n"
-        f"➥ /addauto — Set up auto-update\n"
+        f"**Auto-Update:**\n"
+        f"➥ /addauto — New auto-update watcher\n"
         f"➥ /myautos — View your autos\n"
-        f"➥ /runnow — Run immediately\n"
-        f"➥ /delauto — Delete an auto\n"
+        f"➥ /runnow — Trigger immediately\n"
+        f"➥ /delauto — Delete an auto\n\n"
+        f"{'▰'*16}\n"
+        f"Owner commands: /addauth /rmauth /users /broadcast /reset\n"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔙 Back", callback_data="back_main")
@@ -2786,10 +3817,10 @@ def reset_and_set_commands():
         {"command": "users",       "description": "👥 List users (owner)"},
         {"command": "broadcast",   "description": "📢 Broadcast (owner)"},
         {"command": "broadusers",  "description": "👨‍👩‍👧‍👦 Broadcast users (owner)"},
-        {"command": "addauto",     "description": "🤖 Add auto-update"},
-        {"command": "myautos",     "description": "📋 View my auto-updates"},
-        {"command": "runnow",      "description": "▶️ Run auto now"},
-        {"command": "delauto",     "description": "🗑️ Delete auto-update"},
+        {"command": "addauto",     "description": "🔔 Set up auto-update watcher"},
+        {"command": "myautos",     "description": "📋 List your auto-updates"},
+        {"command": "runnow",      "description": "🚀 Trigger auto-update now"},
+        {"command": "delauto",     "description": "🗑️ Delete an auto-update"},
     ]
     requests.post(f"{base}/setMyCommands", json={"commands": commands}, timeout=10)
 
@@ -2807,18 +3838,33 @@ def load_cookies_from_db():
         print(f"\033[91m✕ Failed to load cookies from DB: {e}\033[0m")
 
 
+def _start_scheduler():
+    """
+    Initialise MongoDB indexes and start the APScheduler.
+    Called once at startup, before bot.run().
+    """
+    _ensure_scheduler_indexes()
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        run_all_due_autos,
+        CronTrigger(minute="*"),
+        id="auto_update_job",
+        max_instances=1,
+        coalesce=True
+    )
+    scheduler.start()
+    print("\033[92m✓ Auto-Update Scheduler started (checks every minute for IST time match)\033[0m")
+
+
 if __name__ == "__main__":
     reset_and_set_commands()
     notify_owner()
-    load_cookies_from_db()
-    os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
-    print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
+load_cookies_from_db()
+os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
+os.makedirs(os.path.join(tempfile.gettempdir(), "auto_dl"),   exist_ok=True)
 
-    async def run():
-        await bot.start()
-        await start_scheduler(bot)
-        await idle()
-        await bot.stop()
+_start_scheduler()
 
-    bot.loop.run_until_complete(run())
+print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
+bot.run()
