@@ -67,8 +67,8 @@ from auth import (
     check_auth
 )
 
-from pyromod import listen
-from pyrogram import Client, filters
+from pyromod import Client
+from pyrogram import filters
 from pyrogram.types import Message, InputMediaPhoto
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, InputUserDeactivated
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -3878,6 +3878,6 @@ if __name__ == "__main__":
     async def _main():
         async with bot:
             await _on_startup()
-            await asyncio.Event().wait()   # keep running forever
+            await bot.idle()   # process updates forever
 
     asyncio.run(_main())
