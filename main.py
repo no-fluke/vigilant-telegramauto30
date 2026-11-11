@@ -2810,17 +2810,15 @@ def load_cookies_from_db():
 if __name__ == "__main__":
     reset_and_set_commands()
     notify_owner()
+    load_cookies_from_db()
+    os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
-load_cookies_from_db()
-os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
+    print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
 
-print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
-from pyrogram import idle   # add this at the top with other pyrogram imports
+    async def run():
+        await bot.start()
+        await start_scheduler(bot)
+        await idle()
+        await bot.stop()
 
-async def run():
-    await bot.start()
-    await start_scheduler(bot)
-    await idle()
-    await bot.stop()
-
-bot.loop.run_until_complete(run())
+    bot.loop.run_until_complete(run())
