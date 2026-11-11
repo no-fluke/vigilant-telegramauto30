@@ -48,6 +48,8 @@ import aiofiles
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
+from pyrogram import idle
+
 
 from logs import logging
 import saini as helper
