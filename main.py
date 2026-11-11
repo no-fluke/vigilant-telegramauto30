@@ -2813,5 +2813,9 @@ load_cookies_from_db()
 os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
-start_scheduler(bot)
-bot.run()
+async def run():
+    async with bot:
+        await start_scheduler(bot)
+        await asyncio.idle()
+
+asyncio.run(run())
