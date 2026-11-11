@@ -41,7 +41,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db import db
-from vars import CREDIT
+
+# to:
+from vars import CREDIT, BOT_TOKEN
 
 # ══════════════════════════════════════════════════════
 #  CONFIG
