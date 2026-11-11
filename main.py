@@ -67,8 +67,8 @@ from auth import (
     check_auth
 )
 
-from pyromod import Client
-from pyrogram import filters
+import pyromod  # noqa: F401 — patches pyrogram.Client with .listen()
+from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, InputUserDeactivated
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
