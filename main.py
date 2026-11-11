@@ -3876,8 +3876,13 @@ if __name__ == "__main__":
     notify_owner()
 
     async def _main():
-        async with bot:
-            await _on_startup()
-            await bot.idle()   # process updates forever
+        await bot.start()
+        await _on_startup()
+        print("\033[92m✓ Bot is online and listening for updates\033[0m")
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()   # keep alive forever until killed
+        finally:
+            await bot.stop()
 
     asyncio.run(_main())
