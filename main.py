@@ -66,6 +66,7 @@ from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, InputUserDe
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from subprocess import getstatusoutput
 from aiohttp import ClientSession
+from scheduler import start_scheduler
 
 # ══════════════════════════════════════════════════════
 #  CONSTANTS  (AppX / HAR-verified)
@@ -2635,7 +2636,13 @@ async def cmd_callback(client, cq):
         f"➥ /logs — View bot logs\n"
         f"➥ /cookies — Update YouTube cookies\n\n"
         f"{'▰'*16}\n"
-        f"Owner commands: /addauth /rmauth /users /broadcast /reset\n"
+        f"Owner commands: /addauth /rmauth /users /broadcast /reset\n\n"
+        f"{'▰'*16}\n"
+        f"**🤖 Auto-Update**\n"
+        f"➥ /addauto — Set up auto-update\n"
+        f"➥ /myautos — View your autos\n"
+        f"➥ /runnow — Run immediately\n"
+        f"➥ /delauto — Delete an auto\n"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔙 Back", callback_data="back_main")
@@ -2777,6 +2784,10 @@ def reset_and_set_commands():
         {"command": "users",       "description": "👥 List users (owner)"},
         {"command": "broadcast",   "description": "📢 Broadcast (owner)"},
         {"command": "broadusers",  "description": "👨‍👩‍👧‍👦 Broadcast users (owner)"},
+        {"command": "addauto",     "description": "🤖 Add auto-update"},
+        {"command": "myautos",     "description": "📋 View my auto-updates"},
+        {"command": "runnow",      "description": "▶️ Run auto now"},
+        {"command": "delauto",     "description": "🗑️ Delete auto-update"},
     ]
     requests.post(f"{base}/setMyCommands", json={"commands": commands}, timeout=10)
 
@@ -2802,4 +2813,5 @@ load_cookies_from_db()
 os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
+start_scheduler(bot)
 bot.run()
