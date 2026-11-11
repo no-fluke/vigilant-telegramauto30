@@ -164,7 +164,9 @@ async def _create_topic(bot: Client, supergroup_id: int, subject_name: str):
             json={"chat_id": supergroup_id, "name": f"📚 {subject_name}"}
         ).json()
         if api_resp.get("ok"):
-            return api_resp["result"]["message_thread_id"]
+            tid = api_resp["result"]["message_thread_id"]
+            logger.info(f"[Scheduler] Topic created: id={tid} name={subject_name}")
+            return tid
         else:
             logger.error(f"[Scheduler] Topic creation failed: {api_resp}")
             return None
@@ -199,31 +201,57 @@ async def _send_to_topic(
         file_path: str | None,
         caption: str,
         is_video: bool = False):
-    """Send a file to a supergroup topic thread via HTTP Bot API."""
+    """
+    Send a file to a supergroup topic thread.
+    - Files ≤ 50 MB  → HTTP Bot API (avoids MTProto peer cache issues)
+    - Files  > 50 MB → Pyrogram MTProto (Bot API limit is 50 MB)
+    """
     if not file_path or not os.path.exists(file_path):
         logger.warning(f"[Scheduler] File not found: {file_path}")
         return
-    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-    method  = "sendVideo" if is_video else "sendDocument"
-    field   = "video"    if is_video else "document"
-    try:
-        with open(file_path, "rb") as f:
-            resp = requests.post(
-                url + method,
-                data={
-                    "chat_id":            supergroup_id,
-                    "message_thread_id":  topic_id,
-                    "caption":            caption[:1024],
-                    "parse_mode":         "Markdown",
-                    "supports_streaming": "true" if is_video else "false",
-                },
-                files={field: f},
-                timeout=300
-            ).json()
-        if not resp.get("ok"):
-            logger.error(f"[Scheduler] Send error: {resp.get('description')}")
-    except Exception as e:
-        logger.error(f"[Scheduler] Send error: {e}")
+
+    file_size = os.path.getsize(file_path)
+    use_pyrogram = file_size > 50 * 1024 * 1024   # > 50 MB
+
+    if use_pyrogram:
+        # Force Pyrogram to cache the peer before sending
+        try:
+            await bot.get_chat(supergroup_id)
+        except Exception:
+            pass
+        if is_video:
+            await _safe_send(bot.send_video(
+                supergroup_id, file_path, caption=caption,
+                reply_to_message_id=topic_id, supports_streaming=True
+            ))
+        else:
+            await _safe_send(bot.send_document(
+                supergroup_id, file_path, caption=caption,
+                reply_to_message_id=topic_id
+            ))
+    else:
+        # HTTP Bot API for files ≤ 50 MB
+        api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+        method  = "sendVideo"    if is_video else "sendDocument"
+        field   = "video"        if is_video else "document"
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.post(
+                    api_url + method,
+                    data={
+                        "chat_id":            supergroup_id,
+                        "message_thread_id":  topic_id,
+                        "caption":            caption[:1024],
+                        "parse_mode":         "Markdown",
+                        "supports_streaming": "true" if is_video else "false",
+                    },
+                    files={field: f},
+                    timeout=300
+                ).json()
+            if not resp.get("ok"):
+                logger.error(f"[Scheduler] Send error: {resp.get('description')}")
+        except Exception as e:
+            logger.error(f"[Scheduler] Send error: {e}")
 
 # ══════════════════════════════════════════════════════
 #  CORE AUTO-UPDATE JOB
