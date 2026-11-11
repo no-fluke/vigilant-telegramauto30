@@ -30,6 +30,7 @@ import asyncio
 import logging
 import tempfile
 import aiohttp
+import requests
 
 from datetime import datetime, timezone, timedelta
 from pyrogram import Client, filters
@@ -41,8 +42,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db import db
-
-# to:
 from vars import CREDIT, BOT_TOKEN
 
 # ══════════════════════════════════════════════════════
@@ -160,19 +159,15 @@ async def _validate_token(session: aiohttp.ClientSession,
 async def _create_topic(bot: Client, supergroup_id: int, subject_name: str):
     """Create a forum topic; returns thread_id or None."""
     try:
-       import requests
-from vars import BOT_TOKEN
-
-api_resp = requests.post(
-    f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
-    json={"chat_id": supergroup_id, "name": f"📚 {subject_name}"}
-).json()
-if api_resp.get("ok"):
-    return api_resp["result"]["message_thread_id"]
-else:
-    logger.error(f"[Scheduler] Topic creation failed: {api_resp}")
-    return None
-        return topic.id
+        api_resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
+            json={"chat_id": supergroup_id, "name": f"📚 {subject_name}"}
+        ).json()
+        if api_resp.get("ok"):
+            return api_resp["result"]["message_thread_id"]
+        else:
+            logger.error(f"[Scheduler] Topic creation failed: {api_resp}")
+            return None
     except ChatAdminRequired:
         logger.error(f"[Scheduler] Bot is not admin in {supergroup_id}")
         return None
@@ -1166,7 +1161,10 @@ async def delauto_handler(bot: Client, m: Message):
             tid = s.get("topic_thread_id")
             if tid and sg_id:
                 try:
-                    await bot.delete_forum_topic(sg_id, tid)
+                    requests.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
+                        json={"chat_id": sg_id, "message_thread_id": tid}
+                    )
                     removed += 1
                 except Exception:
                     pass
@@ -1202,7 +1200,10 @@ async def delauto_handler(bot: Client, m: Message):
                 tid = s.get("topic_thread_id")
                 if tid and sg_id:
                     try:
-                        await bot.delete_forum_topic(sg_id, tid)
+                        requests.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
+                            json={"chat_id": sg_id, "message_thread_id": tid}
+                        )
                     except Exception:
                         pass
                 removed_names.append(s["subject_name"])
@@ -1231,7 +1232,7 @@ async def delauto_handler(bot: Client, m: Message):
 #  SCHEDULER STARTUP — call once from main.py
 # ══════════════════════════════════════════════════════
 
-async def start_scheduler(bot: Client):
+def start_scheduler(bot: Client):
     """
     Call this once from main.py after the bot object is created.
 
