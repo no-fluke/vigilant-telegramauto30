@@ -160,7 +160,18 @@ async def _validate_token(session: aiohttp.ClientSession,
 async def _create_topic(bot: Client, supergroup_id: int, subject_name: str):
     """Create a forum topic; returns thread_id or None."""
     try:
-        topic = await bot.create_forum_topic(supergroup_id, f"📚 {subject_name}")
+       import requests
+from vars import BOT_TOKEN
+
+api_resp = requests.post(
+    f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
+    json={"chat_id": supergroup_id, "name": f"📚 {subject_name}"}
+).json()
+if api_resp.get("ok"):
+    return api_resp["result"]["message_thread_id"]
+else:
+    logger.error(f"[Scheduler] Topic creation failed: {api_resp}")
+    return None
         return topic.id
     except ChatAdminRequired:
         logger.error(f"[Scheduler] Bot is not admin in {supergroup_id}")
