@@ -3871,12 +3871,23 @@ async def _on_startup():
     print("\033[92m✓ AppX Downloader Bot started\033[0m")
 
 
-async def _startup_hook():
-    await _on_startup()
-    print("\033[92m✓ Bot is online and listening for updates\033[0m")
-
-
 if __name__ == "__main__":
     reset_and_set_commands()
     notify_owner()
-    bot.run(_startup_hook())
+
+    async def _main():
+        await bot.start()
+        await _on_startup()
+        print("\033[92m✓ Bot is online and listening for updates\033[0m")
+        # Keep alive — pyrogram 2.0.106 dispatcher runs in background tasks
+        await asyncio.Event().wait()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        loop.run_until_complete(bot.stop())
+        loop.close()
