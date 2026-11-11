@@ -3838,10 +3838,11 @@ def load_cookies_from_db():
         print(f"\033[91m✕ Failed to load cookies from DB: {e}\033[0m")
 
 
-def _start_scheduler():
+async def _start_scheduler():
     """
     Initialise MongoDB indexes and start the APScheduler.
-    Called once at startup, before bot.run().
+    Must be called from inside a running event loop
+    (i.e. from bot's on_start / startup hook).
     """
     _ensure_scheduler_indexes()
     scheduler = AsyncIOScheduler(timezone="UTC")
@@ -3856,15 +3857,27 @@ def _start_scheduler():
     print("\033[92m✓ Auto-Update Scheduler started (checks every minute for IST time match)\033[0m")
 
 
+@bot.on_message(filters.command("_dummy_never_matches_xz99"))
+async def _dummy(_c, _m):
+    pass
+
+
+async def _on_startup():
+    """Runs inside the event loop right after Pyrogram connects."""
+    load_cookies_from_db()
+    os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
+    os.makedirs(os.path.join(tempfile.gettempdir(), "auto_dl"),   exist_ok=True)
+    await _start_scheduler()
+    print("\033[92m✓ AppX Downloader Bot started\033[0m")
+
+
 if __name__ == "__main__":
     reset_and_set_commands()
     notify_owner()
 
-load_cookies_from_db()
-os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
-os.makedirs(os.path.join(tempfile.gettempdir(), "auto_dl"),   exist_ok=True)
+    async def _main():
+        async with bot:
+            await _on_startup()
+            await asyncio.Event().wait()   # keep running forever
 
-_start_scheduler()
-
-print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
-bot.run()
+    asyncio.run(_main())
