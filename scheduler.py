@@ -199,24 +199,31 @@ async def _send_to_topic(
         file_path: str | None,
         caption: str,
         is_video: bool = False):
-    """Send a file directly to a supergroup topic thread."""
+    """Send a file to a supergroup topic thread via HTTP Bot API."""
     if not file_path or not os.path.exists(file_path):
         logger.warning(f"[Scheduler] File not found: {file_path}")
         return
+    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+    method  = "sendVideo" if is_video else "sendDocument"
+    field   = "video"    if is_video else "document"
     try:
-        await bot.get_chat(supergroup_id)
-    except Exception:
-        pass
-    if is_video:
-        await _safe_send(bot.send_video(
-            supergroup_id, file_path, caption=caption,
-            reply_to_message_id=topic_id, supports_streaming=True
-        ))
-    else:
-        await _safe_send(bot.send_document(
-            supergroup_id, file_path, caption=caption,
-            reply_to_message_id=topic_id
-        ))
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                url + method,
+                data={
+                    "chat_id":            supergroup_id,
+                    "message_thread_id":  topic_id,
+                    "caption":            caption[:1024],
+                    "parse_mode":         "Markdown",
+                    "supports_streaming": "true" if is_video else "false",
+                },
+                files={field: f},
+                timeout=300
+            ).json()
+        if not resp.get("ok"):
+            logger.error(f"[Scheduler] Send error: {resp.get('description')}")
+    except Exception as e:
+        logger.error(f"[Scheduler] Send error: {e}")
 
 # ══════════════════════════════════════════════════════
 #  CORE AUTO-UPDATE JOB
