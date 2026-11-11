@@ -2815,9 +2815,12 @@ load_cookies_from_db()
 os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
-async def run():
-    async with bot:
-        await start_scheduler(bot)
-        await asyncio.idle()
+from pyrogram import idle   # add this at the top with other pyrogram imports
 
-asyncio.run(run())
+async def run():
+    await bot.start()
+    await start_scheduler(bot)
+    await idle()
+    await bot.stop()
+
+bot.loop.run_until_complete(run())
