@@ -203,6 +203,10 @@ async def _send_to_topic(
     if not file_path or not os.path.exists(file_path):
         logger.warning(f"[Scheduler] File not found: {file_path}")
         return
+    try:
+        await bot.get_chat(supergroup_id)
+    except Exception:
+        pass
     if is_video:
         await _safe_send(bot.send_video(
             supergroup_id, file_path, caption=caption,
