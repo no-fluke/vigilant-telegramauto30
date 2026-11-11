@@ -7,6 +7,7 @@
 ║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
 ║     3. Option 6 — Download EVERYTHING in one shot   ║
 ║     4. Auto-Update Scheduler integrated              ║
+║     5. FIXED: bot.run() startup (was asyncio.Event) ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -68,7 +69,7 @@ from auth import (
 )
 
 import pyromod  # noqa: F401 — patches pyrogram.Client with .listen()
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InputMediaPhoto
 from pyrogram.errors import FloodWait, PeerIdInvalid, UserIsBlocked, InputUserDeactivated
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -2312,7 +2313,6 @@ async def appx_main_flow(bot_client: Client, m: Message, user_id_tg: int):
 # ══════════════════════════════════════════════════════
 
 def _aw():
-    """Return the auto_watch MongoDB collection."""
     return db.db["auto_watch"]
 
 
@@ -2354,12 +2354,11 @@ def _delete_auto(user_id: int, auto_id: int):
     _aw().delete_one({"user_id": user_id, "auto_id": auto_id})
 
 # ══════════════════════════════════════════════════════
-#  SCHEDULER — SILENT LOGIN (for token refresh)
+#  SCHEDULER — SILENT LOGIN
 # ══════════════════════════════════════════════════════
 
 async def _fresh_login(session: aiohttp.ClientSession,
                        api_base: str, phone: str, password: str):
-    """Non-interactive login. Returns (token, appx_uid) or (None, None)."""
     headers = {**APPX_HEADERS, "content-type": "application/x-www-form-urlencoded"}
     for endpoint in [
         f"{api_base}/post/userLogin",
@@ -2397,7 +2396,6 @@ async def _validate_token(session: aiohttp.ClientSession,
 # ══════════════════════════════════════════════════════
 
 async def _create_topic(supergroup_id: int, subject_name: str):
-    """Create a forum topic. Returns thread_id or None."""
     try:
         api_resp = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
@@ -2416,7 +2414,6 @@ async def _create_topic(supergroup_id: int, subject_name: str):
 
 
 async def _safe_send(coro):
-    """Wrap a send coroutine with FloodWait + retry."""
     for attempt in range(5):
         try:
             return await coro
@@ -2435,11 +2432,6 @@ async def _send_to_topic(
         file_path: str | None,
         caption: str,
         is_video: bool = False):
-    """
-    Send a file to a supergroup topic thread.
-    Files ≤ 50 MB  → HTTP Bot API
-    Files  > 50 MB → Pyrogram MTProto
-    """
     if not file_path or not os.path.exists(file_path):
         print(f"[Scheduler] File not found: {file_path}")
         return
@@ -2490,12 +2482,6 @@ async def _send_to_topic(
 # ══════════════════════════════════════════════════════
 
 async def _run_auto_update(doc: dict):
-    """
-    Process one auto_watch document:
-    - For each subject → fetch new lectures/pdfs/quizzes/tests
-    - Send only NEW items to the correct supergroup topic thread
-    - Save updated seen-ID sets back to MongoDB
-    """
     user_id     = doc["user_id"]
     auto_id     = doc["auto_id"]
     api_base    = doc["api_base"]
@@ -2515,7 +2501,6 @@ async def _run_auto_update(doc: dict):
 
     async with aiohttp.ClientSession() as session:
 
-        # ── Token check / refresh ────────────────────────────────────────
         token_ok = False
         if token and appx_uid:
             token_ok = await _validate_token(session, api_base, token, appx_uid)
@@ -2603,7 +2588,6 @@ async def _run_auto_update(doc: dict):
                         or (raw_qid not in ("", "0", "-1", "None"))
                     )
 
-                    # ── NEW QUIZ ─────────────────────────────────────────
                     if has_quiz and track_quiz and raw_qid and raw_qid not in seen_quiz_ids:
                         new_quiz_ids.add(raw_qid)
                         questions = await fetch_quiz(session, api_base, raw_qid, appx_uid, hdr)
@@ -2628,11 +2612,9 @@ async def _run_auto_update(doc: dict):
                                 "quiz" in mat.lower() and mat.upper() != "VIDEO"):
                             continue
 
-                    # ── Resolve video / PDF URL ──────────────────────────
                     vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
                         await resolve_video(session, api_base, course_id, lec_id, hdr)
 
-                    # ── NEW PDF-type lecture ──────────────────────────────
                     if vtype == "pdf" and track_pdf and lec_id not in seen_pdf_ids:
                         new_pdf_ids.add(lec_id)
                         if url:
@@ -2670,7 +2652,6 @@ async def _run_auto_update(doc: dict):
                                     pass
                         continue
 
-                    # ── PDFs attached to a VIDEO lecture ──────────────────
                     if track_pdf and class_pdfs:
                         for suffix, purl in class_pdfs:
                             if not purl:
@@ -2694,7 +2675,6 @@ async def _run_auto_update(doc: dict):
                                 except Exception:
                                     pass
 
-                    # ── NEW VIDEO LECTURE ────────────────────────────────
                     if track_lec and lec_id not in seen_lec_ids and url:
                         new_lec_ids.add(lec_id)
                         out_path = os.path.join(tmp_dir, f"lec_{lec_id}")
@@ -2726,7 +2706,6 @@ async def _run_auto_update(doc: dict):
 
                     await asyncio.sleep(0.5)
 
-            # ── TEST SERIES for this subject ─────────────────────────────
             if track_tests:
                 ts_list = await get_test_series_list(
                     session, api_base, appx_uid, course_id, hdr
@@ -2826,14 +2805,12 @@ async def _run_auto_update(doc: dict):
                                 pass
                         await asyncio.sleep(0.3)
 
-            # ── Persist updated seen-ID sets ─────────────────────────────
             subj["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
             subj["last_pdf_ids"]     = list(seen_pdf_ids | new_pdf_ids)
             subj["last_quiz_ids"]    = list(seen_quiz_ids | new_quiz_ids)
             subj["last_test_ids"]    = list(seen_test_ids | new_test_ids)
             updated_subjects.append(subj)
 
-        # ── Save updated state ───────────────────────────────────────────
         _aw().update_one(
             {"user_id": user_id, "auto_id": auto_id},
             {"$set": {
@@ -2845,7 +2822,6 @@ async def _run_auto_update(doc: dict):
 
 
 async def run_all_due_autos():
-    """Called every minute by APScheduler. Fires autos whose IST HH:MM matches now."""
     now_ist = datetime.now(IST).strftime("%H:%M")
     due = list(_aw().find({"check_time_ist": now_ist, "is_active": True}))
     if not due:
@@ -2886,7 +2862,6 @@ async def addauto_handler(bot_client: Client, m: Message):
         await m.reply_text("❌ No auto-ID available. Use /delauto to free one.")
         return
 
-    # ── Step 1: API Domain ───────────────────────────────────────────────
     ask = await m.reply_text(
         "**🔧 Auto-Setup — Step 1/7**\n\n"
         "🌐 **Enter your AppX API domain:**\n"
@@ -2906,7 +2881,6 @@ async def addauto_handler(bot_client: Client, m: Message):
     await msg.delete(); await ask.delete()
     api_base = f"https://{raw_domain}" if not raw_domain.startswith("http") else raw_domain
 
-    # ── Step 2: Login method ─────────────────────────────────────────────
     ask = await m.reply_text(
         "**🔧 Auto-Setup — Step 2/7**\n\n"
         "🔐 **Login method:**\n\n"
@@ -2971,7 +2945,6 @@ async def addauto_handler(bot_client: Client, m: Message):
             return
         await wait.edit_text("✅ Login successful!")
 
-    # ── Fetch courses ────────────────────────────────────────────────────
     wait = await m.reply_text("⏳ Fetching your courses…")
     async with aiohttp.ClientSession() as session:
         hdr     = make_headers(token, appx_uid)
@@ -2984,7 +2957,6 @@ async def addauto_handler(bot_client: Client, m: Message):
         )
         return
 
-    # ── Step 3: Select course ────────────────────────────────────────────
     course_text = "**📚 Auto-Setup — Step 3/7 — Select Course**\n\nYour courses:\n\n"
     for i, c in enumerate(courses[:20], 1):
         name = c.get("course_name") or c.get("title") or f"Course {i}"
@@ -3007,7 +2979,6 @@ async def addauto_handler(bot_client: Client, m: Message):
     course_id     = str(chosen_course.get("id") or chosen_course.get("courseid", ""))
     course_name   = chosen_course.get("course_name") or chosen_course.get("title", "")
 
-    # ── Step 4: Select subjects ──────────────────────────────────────────
     wait = await m.reply_text("⏳ Fetching subjects…")
     async with aiohttp.ClientSession() as session:
         hdr          = make_headers(token, appx_uid)
@@ -3043,7 +3014,6 @@ async def addauto_handler(bot_client: Client, m: Message):
     if not chosen_subjects:
         await m.reply_text("❌ No valid subjects selected."); return
 
-    # ── Step 5: What to track ────────────────────────────────────────────
     ask = await m.reply_text(
         "**🔍 Auto-Setup — Step 5/7 — What to Track**\n\n"
         "`1` 📹 Lectures (videos)\n"
@@ -3075,7 +3045,6 @@ async def addauto_handler(bot_client: Client, m: Message):
     if not any([track_lec, track_pdf, track_quiz, track_tests]):
         await m.reply_text("❌ Nothing selected to track. Use /addauto again."); return
 
-    # ── Step 6: Brand name ───────────────────────────────────────────────
     ask = await m.reply_text(
         "**🏷️ Auto-Setup — Step 6/7 — Brand Name**\n\n"
         "Send your channel name / watermark for captions\n"
@@ -3091,7 +3060,6 @@ async def addauto_handler(bot_client: Client, m: Message):
         brand = CREDIT
         await ask.delete()
 
-    # ── Step 7a: Supergroup ID ───────────────────────────────────────────
     ask = await m.reply_text(
         "**🏠 Auto-Setup — Step 7a/7 — Supergroup ID**\n\n"
         "Send the **Supergroup ID** with Topics enabled.\n"
@@ -3109,7 +3077,6 @@ async def addauto_handler(bot_client: Client, m: Message):
         await m.reply_text("❌ Invalid Supergroup ID."); return
     await msg.delete(); await ask.delete()
 
-    # ── Step 7b: Schedule time ───────────────────────────────────────────
     ask = await m.reply_text(
         "**🕒 Auto-Setup — Step 7b/7 — Schedule Time (IST)**\n\n"
         "What time should I check for new content daily?\n"
@@ -3130,7 +3097,6 @@ async def addauto_handler(bot_client: Client, m: Message):
     if not (0 <= h <= 23 and 0 <= mi <= 59):
         await m.reply_text("❌ Invalid time values. Use /addauto again."); return
 
-    # ── Create supergroup topics ─────────────────────────────────────────
     creating = await m.reply_text(
         f"⏳ Creating **{len(chosen_subjects)}** topic(s) in your supergroup…"
     )
@@ -3166,7 +3132,6 @@ async def addauto_handler(bot_client: Client, m: Message):
         )
         return
 
-    # ── Save to MongoDB ──────────────────────────────────────────────────
     doc = {
         "user_id":        uid,
         "auto_id":        auto_id,
@@ -3435,7 +3400,7 @@ async def delauto_handler(bot_client: Client, m: Message):
         await m.reply_text("❌ Invalid choice. Use /delauto again.")
 
 # ══════════════════════════════════════════════════════
-#  STANDARD BOT HANDLERS  (unchanged from original)
+#  STANDARD BOT HANDLERS
 # ══════════════════════════════════════════════════════
 
 m_file_path = "main.py"
@@ -3784,7 +3749,7 @@ async def appx_handler(bot_client: Client, m: Message):
         cancel_requested[user_id]   = False
 
 # ══════════════════════════════════════════════════════
-#  STARTUP
+#  STARTUP HELPERS
 # ══════════════════════════════════════════════════════
 
 def notify_owner():
@@ -3839,11 +3804,6 @@ def load_cookies_from_db():
 
 
 async def _start_scheduler():
-    """
-    Initialise MongoDB indexes and start the APScheduler.
-    Must be called from inside a running event loop
-    (i.e. from bot's on_start / startup hook).
-    """
     _ensure_scheduler_indexes()
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
@@ -3857,37 +3817,23 @@ async def _start_scheduler():
     print("\033[92m✓ Auto-Update Scheduler started (checks every minute for IST time match)\033[0m")
 
 
-@bot.on_message(filters.command("_dummy_never_matches_xz99"))
-async def _dummy(_c, _m):
-    pass
+# ══════════════════════════════════════════════════════
+#  ENTRY POINT  ← THE ONLY THING THAT CHANGED FROM v1.3
+# ══════════════════════════════════════════════════════
 
-
-async def _on_startup():
-    """Runs inside the event loop right after Pyrogram connects."""
+if __name__ == "__main__":
+    # Synchronous pre-flight
+    reset_and_set_commands()
+    notify_owner()
     load_cookies_from_db()
     os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
     os.makedirs(os.path.join(tempfile.gettempdir(), "auto_dl"),   exist_ok=True)
-    await _start_scheduler()
-    print("\033[92m✓ AppX Downloader Bot started\033[0m")
-
-
-if __name__ == "__main__":
-    reset_and_set_commands()
-    notify_owner()
 
     async def _main():
         await bot.start()
-        await _on_startup()
-        print("\033[92m✓ Bot is online and listening for updates\033[0m")
-        # Keep alive — pyrogram 2.0.106 dispatcher runs in background tasks
-        await asyncio.Event().wait()
+        await _start_scheduler()
+        print("\033[92m✓ AppX Downloader Bot is online and listening\033[0m")
+        await idle()          # ← Pyrogram's own keep-alive; yields to dispatcher
+        await bot.stop()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        loop.run_until_complete(bot.stop())
-        loop.close()
+    asyncio.run(_main())
