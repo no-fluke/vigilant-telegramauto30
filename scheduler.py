@@ -1218,7 +1218,7 @@ async def delauto_handler(bot: Client, m: Message):
 #  SCHEDULER STARTUP — call once from main.py
 # ══════════════════════════════════════════════════════
 
-def start_scheduler(bot: Client):
+async def start_scheduler(bot: Client):
     """
     Call this once from main.py after the bot object is created.
 
