@@ -2777,6 +2777,10 @@ def reset_and_set_commands():
         {"command": "users",       "description": "👥 List users (owner)"},
         {"command": "broadcast",   "description": "📢 Broadcast (owner)"},
         {"command": "broadusers",  "description": "👨‍👩‍👧‍👦 Broadcast users (owner)"},
+        {"command": "addauto",     "description": "🔁 Add auto-update schedule"},
+        {"command": "myautos",     "description": "📋 View your auto-updates"},
+        {"command": "delauto",     "description": "🗑️ Delete an auto-update"},
+        {"command": "runnow",      "description": "⚡ Run auto-update now"},
     ]
     requests.post(f"{base}/setMyCommands", json={"commands": commands}, timeout=10)
 
@@ -2800,6 +2804,13 @@ if __name__ == "__main__":
 
 load_cookies_from_db()
 os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
+
+from scheduler import start_scheduler
+
+async def _startup():
+    await start_scheduler(bot)
+
+bot.loop.run_until_complete(_startup())
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
 bot.run()
