@@ -151,6 +151,27 @@ def _make_thumb(video_path: str):
     return None
 
 
+def _probe_video(video_path: str):
+    """Return (duration_secs, width, height) via ffprobe. Falls back to (0,0,0)."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-show_entries", "format=duration",
+             "-of", "json", video_path],
+            capture_output=True, text=True, timeout=30
+        )
+        data = json.loads(r.stdout)
+        dur    = int(float(data.get("format", {}).get("duration", 0) or 0))
+        stream = data.get("streams", [{}])[0] if data.get("streams") else {}
+        w      = int(stream.get("width",  0) or 0)
+        h      = int(stream.get("height", 0) or 0)
+        return dur, w, h
+    except Exception:
+        return 0, 0, 0
+
+
 # ── Flood-wait wrapper ───────────────────────────────────────────────────────
 
 async def _safe_send(coro):
@@ -210,6 +231,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     file_size    = os.path.getsize(file_path)
     use_pyrogram = file_size > 50 * 1024 * 1024
     thumb_path   = _make_thumb(file_path) if is_video else None
+    vid_dur, vid_w, vid_h = _probe_video(file_path) if is_video else (0, 0, 0)
 
     try:
         if use_pyrogram:
@@ -222,6 +244,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                     supergroup_id, file_path, caption=caption,
                     reply_to_message_id=topic_id, supports_streaming=True,
                     thumb=thumb_path,
+                    duration=vid_dur, width=vid_w, height=vid_h,
                 ))
             else:
                 await _safe_send(bot.send_document(
@@ -246,6 +269,12 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 "parse_mode":         "HTML",          # was "Markdown" — WRONG
                 "supports_streaming": "true" if is_video else "false",
             }
+            if is_video and vid_dur:
+                post_data["duration"] = str(vid_dur)
+            if is_video and vid_w:
+                post_data["width"]    = str(vid_w)
+            if is_video and vid_h:
+                post_data["height"]   = str(vid_h)
 
             with open(file_path, "rb") as f:
                 files = {field: (display_name, f, mime)}
@@ -1014,6 +1043,24 @@ async def addauto_handler(bot: Client, m: Message):
         await m.reply_text("❌ Invalid time values.")
         return
 
+    # Step 7c: Quality
+    ask = await m.reply_text(
+        "<b>🎬 Auto-Setup — Step 7c/7 — Video Quality</b>\n\n"
+        "<code>1</code> — 1080p\n"
+        "<code>2</code> — 720p (default)\n"
+        "<code>3</code> — 480p\n"
+        "<code>4</code> — 360p\n\n"
+        "_Send choice (20s timeout → 720p):_"
+    )
+    try:
+        msg = await bot.listen(chat_id=m.chat.id, timeout=20)
+        q_map = {"1": "1080p", "2": "720p", "3": "480p", "4": "360p"}
+        prefer_quality = q_map.get((msg.text or "").strip(), "720p")
+        await msg.delete(); await ask.delete()
+    except Exception:
+        prefer_quality = "720p"
+        await ask.delete()
+
     # Fetch topics per subject and create Telegram topic threads
     creating = await m.reply_text(
         f"⏳ Fetching topics and creating Telegram threads for "
@@ -1084,7 +1131,7 @@ async def addauto_handler(bot: Client, m: Message):
         "supergroup_id":  sg_id,
         "check_time_ist": time_input,
         "brand":          brand,
-        "prefer_quality": "720p",
+        "prefer_quality": prefer_quality,
         "track_lectures": track_lec,
         "track_pdfs":     track_pdf,
         "track_quizzes":  track_quiz,
@@ -1109,6 +1156,7 @@ async def addauto_handler(bot: Client, m: Message):
         f"📖 <b>Subjects:</b> {len(subjects_docs)}\n"
         f"🔍 <b>Tracking:</b> {' | '.join(track_labels)}\n"
         f"🕒 <b>Daily at:</b> <code>{time_input}</code> IST\n"
+        f"🎬 <b>Quality:</b> {prefer_quality}\n"
         f"🏠 <b>Supergroup:</b> <code>{sg_id}</code>\n"
         f"🏷️ <b>Brand:</b> <code>{brand}</code>\n"
     )
