@@ -471,6 +471,26 @@ def _migrate_cdn(url: str) -> str:
     return url
 
 
+def _patch_hls_quality(url: str, target_quality: str) -> str:
+    """
+    ClassX HLS URLs have the quality baked into the path:
+      .../hls-dc<hash>/480p/<file>  or  .../hls-drm<hash>/720p/<file>
+    If the API hands us a lower-quality URL but a higher quality exists on
+    the same CDN, we can swap the segment. We only patch the path component
+    so query-string tokens (signatures, expiry) stay intact.
+    """
+    if not url or not target_quality:
+        return url
+    import re
+    # Match /hls-dc.../NNNp/ or /hls-drm.../NNNp/  anywhere in the path
+    new_url = re.sub(
+        r'(hls-(?:dc|drm)[^/]*/)(\d+p)(/)',
+        lambda m: m.group(1) + target_quality + m.group(3),
+        url
+    )
+    return new_url
+
+
 def _is_drm_url(url: str) -> bool:
     if not url:
         return False
@@ -735,6 +755,14 @@ async def resolve_video(session, api_base, course_id, video_id, hdr,
             break
     if not chosen_url and by_quality:
         chosen_url = next(iter(by_quality.values()))
+
+    # ── If the preferred quality isn't in the API response, try patching
+    #    the HLS path of whatever URL we got (ClassX CDN stores all qualities
+    #    under the same hash folder — only the /NNNp/ segment differs).
+    if chosen_url and prefer_quality not in by_quality and not _is_mp4_url(chosen_url):
+        patched = _patch_hls_quality(chosen_url, prefer_quality)
+        if patched != chosen_url:
+            chosen_url = patched
 
     if chosen_url:
         vtype = "mp4" if _is_mp4_url(chosen_url) else "hls"
