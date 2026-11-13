@@ -55,8 +55,10 @@ logger = logging.getLogger(__name__)
 
 
 def _m():
-    import main as _main
-    return _main
+    import sys
+    # When run as `python main.py`, the module is registered as '__main__',
+    # not 'main'. Doing `import main` would re-execute main.py and crash.
+    return sys.modules.get('main') or sys.modules['__main__']
 
 
 # ── MongoDB helpers ──────────────────────────────────────────────────────────
