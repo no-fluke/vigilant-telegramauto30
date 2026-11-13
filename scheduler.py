@@ -151,6 +151,19 @@ def _make_thumb(video_path: str):
     return None
 
 
+def _get_video_duration(path: str) -> int:
+    """Return video duration in seconds via ffprobe, or 0 on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30
+        )
+        return int(float(result.stdout.strip()))
+    except Exception:
+        return 0
+
+
 # ── Flood-wait wrapper ───────────────────────────────────────────────────────
 
 async def _safe_send(coro):
@@ -192,6 +205,22 @@ async def _delete_topic(supergroup_id: int, thread_id: int):
         pass
 
 
+async def _get_or_create_topic(supergroup_id: int, name: str,
+                                topic_map: dict, map_key: str):
+    """
+    FIX #duplicate-threads: return existing thread_id from topic_map if
+    already created, otherwise create a new one and store it in the map.
+    Prevents duplicate Telegram topics on every scheduler run.
+    """
+    existing = topic_map.get(str(map_key))
+    if existing:
+        return existing
+    thread_id = await _create_topic(supergroup_id, name)
+    if thread_id:
+        topic_map[str(map_key)] = thread_id
+    return thread_id
+
+
 # ── Send file to topic ───────────────────────────────────────────────────────
 
 async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
@@ -213,15 +242,23 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 
     try:
         if use_pyrogram:
-            try:
-                await bot.get_chat(supergroup_id)
-            except Exception:
-                pass
+            # FIX #PeerInvalid: prime the peer cache with retry so first
+            # upload never raises PeerInvalid on a fresh supergroup.
+            for _attempt in range(2):
+                try:
+                    await bot.get_chat(supergroup_id)
+                    break
+                except Exception:
+                    if _attempt == 0:
+                        await asyncio.sleep(2)
             if is_video:
+                duration = _get_video_duration(file_path)
                 await _safe_send(bot.send_video(
                     supergroup_id, file_path, caption=caption,
                     reply_to_message_id=topic_id, supports_streaming=True,
                     thumb=thumb_path,
+                    duration=duration,
+                    width=1280, height=720,
                 ))
             else:
                 await _safe_send(bot.send_document(
@@ -239,6 +276,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
             mime = mime_map.get(ext, "application/octet-stream")
 
             # FIX #1: parse_mode must be "HTML" — captions use <blockquote> tags
+            # FIX #duration: probe and send duration so Telegram shows correct length
             post_data = {
                 "chat_id":            supergroup_id,
                 "message_thread_id":  topic_id,
@@ -246,6 +284,8 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 "parse_mode":         "HTML",          # was "Markdown" — WRONG
                 "supports_streaming": "true" if is_video else "false",
             }
+            if is_video:
+                post_data["duration"] = str(_get_video_duration(file_path))
 
             with open(file_path, "rb") as f:
                 files = {field: (display_name, f, mime)}
@@ -635,26 +675,24 @@ async def _run_auto_update(bot, doc):
                         continue
 
                     # Create / reuse a dedicated Telegram topic for this series
-                    ts_thread_id = ts_topic_map.get(series_id)
+                    # FIX #duplicate-threads: _get_or_create_topic checks the
+                    # map first so a topic is never created twice for the same
+                    # series_id across runs.
+                    ts_thread_id = await _get_or_create_topic(
+                        sg_id, f"{subj_name} — {series_name}",
+                        ts_topic_map, series_id
+                    )
                     if not ts_thread_id:
-                        ts_thread_id = await _create_topic(
-                            sg_id, f"{subj_name} — {series_name}"
+                        # Fallback: use first topic thread of this subject
+                        ts_thread_id = next(
+                            (t.get("topic_thread_id")
+                             for t in updated_topics
+                             if t.get("topic_thread_id")),
+                            None
                         )
-                        if ts_thread_id:
-                            # FIX #8: cast series_id to str for consistent map key
-                            ts_topic_map[str(series_id)] = ts_thread_id
-                        else:
-                            # Fallback: use first topic thread of this subject
-                            fallback = next(
-                                (t.get("topic_thread_id")
-                                 for t in updated_topics
-                                 if t.get("topic_thread_id")),
-                                None
-                            )
-                            if not fallback:
-                                continue
-                            ts_thread_id = fallback
-                        await asyncio.sleep(0.5)
+                        if not ts_thread_id:
+                            continue
+                    await asyncio.sleep(0.5)
 
                     ts_subjects = await main.get_testseries_subjects(
                         session, api_base, series_id, hdr
@@ -1037,12 +1075,32 @@ async def addauto_handler(bot: Client, m: Message):
 
             topics_docs = []
             for t in topics_raw:
-                tname     = t.get("topic_name", "Topic")
-                tid       = str(t.get("topicid", ""))
-                thread_id = await _create_topic(sg_id, f"{sname} › {tname}")
+                tname = t.get("topic_name", "Topic")
+                tid   = str(t.get("topicid", ""))
+
+                # FIX #duplicate-threads: reuse an existing Telegram thread if
+                # this user already has one for this topic in this supergroup.
+                thread_id = None
+                existing_auto = _aw().find_one(
+                    {"user_id": uid, "supergroup_id": sg_id,
+                     "subjects.topics.topic_id": tid},
+                    {"subjects.$": 1}
+                )
+                if existing_auto:
+                    for ex_subj in existing_auto.get("subjects", []):
+                        for ex_topic in ex_subj.get("topics", []):
+                            if str(ex_topic.get("topic_id")) == tid:
+                                thread_id = ex_topic.get("topic_thread_id")
+                                break
+                        if thread_id:
+                            break
+
+                if not thread_id:
+                    thread_id = await _create_topic(sg_id, f"{sname} › {tname}")
+                    await asyncio.sleep(0.5)
+
                 if thread_id is None:
                     failed_threads.append(f"{sname} › {tname}")
-                    await asyncio.sleep(0.5)
                     continue
                 topics_docs.append({
                     "topic_id":         tid,
@@ -1053,7 +1111,6 @@ async def addauto_handler(bot: Client, m: Message):
                     "last_quiz_ids":    [],
                 })
                 total_threads += 1
-                await asyncio.sleep(0.5)
 
             if topics_docs:
                 subjects_docs.append({
