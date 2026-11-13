@@ -2807,10 +2807,7 @@ os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
 from scheduler import start_scheduler
 
-async def _startup():
-    await start_scheduler(bot)
-
-bot.loop.run_until_complete(_startup())
+asyncio.get_event_loop().run_until_complete(start_scheduler(bot))
 
 print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
 bot.run()
