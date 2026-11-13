@@ -226,8 +226,9 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
 async def _prime_peer(bot, supergroup_id: int, retries: int = 3):
     """
     Force Pyrogram to resolve and cache the peer for supergroup_id.
-    Must be called before any send — both pyrogram and requests paths need
-    the peer in cache for flood-safe operations.
+    Best-effort: callers must NOT abort if this returns False, since the
+    requests-based send path doesn't need it and the pyrogram path will
+    surface its own error via _safe_send / logger.
     Exponential back-off: 1s → 2s → 4s across retries.
     """
     for attempt in range(retries):
@@ -247,26 +248,22 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     """
     Send a file to a supergroup forum topic.
 
-    FIX #PeerInvalid  : always prime the peer cache BEFORE choosing the
-                        upload path (not just inside the pyrogram branch).
+    FIX #PeerInvalid  : peer priming is ONLY done inside the pyrogram
+                        (large-file) branch where Pyrogram actually needs the
+                        access hash.  The requests path uses the Bot-API token
+                        and never needs the Pyrogram peer cache.
+                        Crucially we do NOT return early on a failed prime —
+                        the actual send call will surface and log the error
+                        itself.  Calling _prime_peer for every file (as the
+                        previous revision did) caused rate-limit bursts and
+                        could make _prime_peer return False for a healthy
+                        supergroup, silently dropping all uploads.
     FIX #parse_mode   : use HTML so <blockquote> captions render correctly.
-    FIX #small-files  : files ≤50 MB also benefit from peer priming so the
-                        requests fallback never hits PeerInvalid indirectly
-                        via flood-wait wrappers.
     """
     if not file_path or not os.path.exists(file_path):
         return
     if not display_name:
         display_name = os.path.basename(file_path)
-
-    # ── Always prime peer cache first ────────────────────────────────────
-    peer_ok = await _prime_peer(bot, supergroup_id)
-    if not peer_ok:
-        logger.error(
-            f"[Scheduler] PeerInvalid — could not resolve {supergroup_id}. "
-            "Check bot is admin in the supergroup."
-        )
-        return
 
     file_size    = os.path.getsize(file_path)
     use_pyrogram = file_size > 50 * 1024 * 1024
@@ -274,6 +271,8 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 
     try:
         if use_pyrogram:
+            # Prime peer cache (best-effort, no early-return on failure)
+            await _prime_peer(bot, supergroup_id)
             if is_video:
                 duration = _get_video_duration(file_path)
                 await _safe_send(bot.send_video(
@@ -398,7 +397,7 @@ async def _run_auto_update(bot, doc):
     tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Prime peer cache once per job run so all sends in this run are safe
+    # Prime peer cache once per job run so pyrogram sends in this run are safe
     await _prime_peer(bot, sg_id, retries=5)
 
     async with aiohttp.ClientSession() as session:
@@ -682,7 +681,7 @@ async def _run_auto_update(bot, doc):
 
                     await asyncio.sleep(0.5)
 
-                # ── Persist updated seen-ID sets (lectures only) ──────────
+                # ── Persist updated seen-ID sets ──────────────────────────
                 topic_doc["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
                 topic_doc["last_pdf_ids"]     = list(seen_pdf_ids | new_pdf_ids)
                 topic_doc["last_quiz_ids"]    = list(seen_quiz_ids | new_quiz_ids)
@@ -1391,13 +1390,21 @@ async def delauto_handler(bot: Client, m: Message):
                     await _delete_topic(sg_id, tid)
                     removed += 1
                 # Also delete any legacy per-topic ts_topic_map entries
+                # FIX #deletion: guard int() with try/except so a bad value
+                # never aborts the loop and skips _delete_auto below.
                 for ts_tid in t.get("ts_topic_map", {}).values():
-                    await _delete_topic(sg_id, int(ts_tid))
-                    removed += 1
+                    try:
+                        await _delete_topic(sg_id, int(ts_tid))
+                        removed += 1
+                    except Exception:
+                        pass
             # Delete subject-level test-series topic threads
             for ts_tid in subj.get("ts_topic_map", {}).values():
-                await _delete_topic(sg_id, int(ts_tid))
-                removed += 1
+                try:
+                    await _delete_topic(sg_id, int(ts_tid))
+                    removed += 1
+                except Exception:
+                    pass
         _delete_auto(uid, auto_id)
         await m.reply_text(
             f"✅ <b>Auto #{auto_id} deleted.</b>\n"
@@ -1438,11 +1445,19 @@ async def delauto_handler(bot: Client, m: Message):
                     if tid and sg_id:
                         await _delete_topic(sg_id, tid)
                     # Legacy per-topic ts_topic_map
+                    # FIX #deletion: guard int() with try/except
                     for ts_tid in t.get("ts_topic_map", {}).values():
-                        await _delete_topic(sg_id, int(ts_tid))
+                        try:
+                            await _delete_topic(sg_id, int(ts_tid))
+                        except Exception:
+                            pass
                 # Subject-level test-series threads
+                # FIX #deletion: guard int() with try/except
                 for ts_tid in s.get("ts_topic_map", {}).values():
-                    await _delete_topic(sg_id, int(ts_tid))
+                    try:
+                        await _delete_topic(sg_id, int(ts_tid))
+                    except Exception:
+                        pass
                 removed_names.append(s["subject_name"])
             else:
                 kept_subjects.append(s)
