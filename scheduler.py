@@ -211,20 +211,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     use_pyrogram = file_size > 50 * 1024 * 1024
     thumb_path   = _make_thumb(file_path) if is_video else None
 
-    # probe duration once so Telegram shows correct video length
-    vid_duration = 0
-    if is_video:
-        try:
-            import json as _json
-            _pr = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "json", file_path],
-                capture_output=True, text=True, timeout=15
-            )
-            vid_duration = int(float(_json.loads(_pr.stdout).get("format", {}).get("duration", 0)))
-        except Exception:
-            vid_duration = 0
-
     try:
         if use_pyrogram:
             try:
@@ -236,7 +222,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                     supergroup_id, file_path, caption=caption,
                     reply_to_message_id=topic_id, supports_streaming=True,
                     thumb=thumb_path,
-                    duration=vid_duration,
                 ))
             else:
                 await _safe_send(bot.send_document(
@@ -260,7 +245,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 "caption":            caption[:1024],
                 "parse_mode":         "HTML",          # was "Markdown" — WRONG
                 "supports_streaming": "true" if is_video else "false",
-                "duration":           vid_duration,
             }
 
             with open(file_path, "rb") as f:
