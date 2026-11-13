@@ -37,6 +37,7 @@ import aiohttp
 import requests
 
 from datetime import datetime, timezone, timedelta
+from pyromod import listen as _pyromod_listen  # patches Client with .listen()
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
@@ -783,7 +784,7 @@ async def addauto_handler(bot: Client, m: Message):
         "Send without <code>https://</code>\n\nSend /cancel to abort.</blockquote>"
     )
     try:
-        msg = await bot.listen(m.chat.id, timeout=120)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=120)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -802,7 +803,7 @@ async def addauto_handler(bot: Client, m: Message):
         "<code>2</code> — JWT Token only\n\nSend <code>1</code> or <code>2</code>:"
     )
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -814,7 +815,7 @@ async def addauto_handler(bot: Client, m: Message):
     if login_choice == "2":
         ask = await m.reply_text("<b>Send your JWT Token:</b>")
         try:
-            msg = await bot.listen(m.chat.id, timeout=120)
+            msg = await bot.listen(chat_id=m.chat.id, timeout=120)
         except Exception:
             await ask.edit_text("⏰ Timed out.")
             return
@@ -826,7 +827,7 @@ async def addauto_handler(bot: Client, m: Message):
                 "⚠️ Could not extract User ID. Send it manually:"
             )
             try:
-                msg2 = await bot.listen(m.chat.id, timeout=60)
+                msg2 = await bot.listen(chat_id=m.chat.id, timeout=60)
                 appx_uid = (msg2.text or "").strip()
                 await msg2.delete(); await ask2.delete()
             except Exception:
@@ -835,7 +836,7 @@ async def addauto_handler(bot: Client, m: Message):
     else:
         ask = await m.reply_text("<b>🔧 Step 2a — Phone / Email:</b>")
         try:
-            msg = await bot.listen(m.chat.id, timeout=120)
+            msg = await bot.listen(chat_id=m.chat.id, timeout=120)
         except Exception:
             await ask.edit_text("⏰ Timed out.")
             return
@@ -844,7 +845,7 @@ async def addauto_handler(bot: Client, m: Message):
 
         ask = await m.reply_text("<b>🔧 Step 2b — Password:</b>")
         try:
-            msg = await bot.listen(m.chat.id, timeout=120)
+            msg = await bot.listen(chat_id=m.chat.id, timeout=120)
         except Exception:
             await ask.edit_text("⏰ Timed out.")
             return
@@ -876,7 +877,7 @@ async def addauto_handler(bot: Client, m: Message):
     ct += "\n<b>Send the course number:</b>"
     await wait.edit_text(ct)
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await m.reply_text("⏰ Timed out.")
         return
@@ -907,7 +908,7 @@ async def addauto_handler(bot: Client, m: Message):
     st += "\n<i>Send numbers comma-separated, or <code>all</code>:</i>"
     await wait2.edit_text(st)
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await m.reply_text("⏰ Timed out.")
         return
@@ -937,7 +938,7 @@ async def addauto_handler(bot: Client, m: Message):
         "<i>Send numbers comma-separated. e.g. <code>1,2,3,4</code> for everything</i>"
     )
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -964,7 +965,7 @@ async def addauto_handler(bot: Client, m: Message):
         "or <code>/d</code> for default:"
     )
     try:
-        msg    = await bot.listen(m.chat.id, timeout=30)
+        msg    = await bot.listen(chat_id=m.chat.id, timeout=30)
         raw_br = (msg.text or "").strip()
         brand  = CREDIT if raw_br == "/d" else raw_br
         await msg.delete(); await ask.delete()
@@ -979,7 +980,7 @@ async def addauto_handler(bot: Client, m: Message):
         "✅ Bot must be <b>admin</b> with <b>Manage Topics</b> permission.</blockquote>"
     )
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -996,7 +997,7 @@ async def addauto_handler(bot: Client, m: Message):
         "<blockquote>HH:MM 24-hour format. e.g. <code>08:00</code> or <code>20:30</code></blockquote>"
     )
     try:
-        msg = await bot.listen(m.chat.id, timeout=60)
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -1195,7 +1196,7 @@ async def runnow_handler(bot: Client, m: Message):
             list_text += "\nSend the number:"
             ask = await m.reply_text(list_text)
             try:
-                msg     = await bot.listen(m.chat.id, timeout=30)
+                msg     = await bot.listen(chat_id=m.chat.id, timeout=30)
                 auto_id = int((msg.text or "").strip())
                 await msg.delete(); await ask.delete()
             except Exception:
@@ -1234,7 +1235,7 @@ async def delauto_handler(bot: Client, m: Message):
     text += "\n<b>Send the auto number to delete:</b>"
     await m.reply_text(text)
     try:
-        pick = await bot.listen(m.chat.id, timeout=60)
+        pick = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await m.reply_text("⏰ Timed out.")
         return
@@ -1257,7 +1258,7 @@ async def delauto_handler(bot: Client, m: Message):
         "<b>Send 1 or 2:</b>"
     )
     try:
-        choice_msg = await bot.listen(m.chat.id, timeout=60)
+        choice_msg = await bot.listen(chat_id=m.chat.id, timeout=60)
     except Exception:
         await ask.edit_text("⏰ Timed out.")
         return
@@ -1291,7 +1292,7 @@ async def delauto_handler(bot: Client, m: Message):
         subj_text += "\n<i>Send numbers comma-separated (e.g. <code>1,3</code>)</i>"
         await m.reply_text(subj_text)
         try:
-            subj_pick = await bot.listen(m.chat.id, timeout=60)
+            subj_pick = await bot.listen(chat_id=m.chat.id, timeout=60)
         except Exception:
             await m.reply_text("⏰ Timed out.")
             return
