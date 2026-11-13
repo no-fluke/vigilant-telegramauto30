@@ -3,9 +3,9 @@
 ║         AppX / Parmar Academy Downloader             ║
 ║           Telegram Bot Edition — v1.2                ║
 ║   Fixes applied:                                     ║
-║     1. Multi-PDF per lecture (class_pdfs[1:] skip)   ║
-║     2. MP4 URL freshness check + 1MB chunk aiohttp   ║
-║     3. Option 6 — Download EVERYTHING in one shot    ║
+║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
+║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
+║     3. Option 6 — Download EVERYTHING in one shot   ║
 ╚══════════════════════════════════════════════════════╝
 
 COMMANDS:
@@ -2744,7 +2744,7 @@ async def appx_handler(bot_client: Client, m: Message):
         cancel_requested[user_id]   = False
 
 # ══════════════════════════════════════════════════════
-#  STARTUP  ← CHANGED: scheduler integration
+#  STARTUP
 # ══════════════════════════════════════════════════════
 
 def notify_owner():
@@ -2777,10 +2777,6 @@ def reset_and_set_commands():
         {"command": "users",       "description": "👥 List users (owner)"},
         {"command": "broadcast",   "description": "📢 Broadcast (owner)"},
         {"command": "broadusers",  "description": "👨‍👩‍👧‍👦 Broadcast users (owner)"},
-        {"command": "addauto",     "description": "🆕 Create auto-update (topic-wise)"},
-        {"command": "myautos",     "description": "📋 List your auto-updates"},
-        {"command": "runnow",      "description": "🚀 Trigger an auto-update now"},
-        {"command": "delauto",     "description": "🗑️ Delete an auto-update"},
     ]
     requests.post(f"{base}/setMyCommands", json={"commands": commands}, timeout=10)
 
@@ -2798,30 +2794,12 @@ def load_cookies_from_db():
         print(f"\033[91m✕ Failed to load cookies from DB: {e}\033[0m")
 
 
-def _bootstrap():
-    """One-time startup: commands menu, owner notify, cookies, temp dir."""
+if __name__ == "__main__":
     reset_and_set_commands()
     notify_owner()
-    load_cookies_from_db()
-    os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
+load_cookies_from_db()
+os.makedirs(os.path.join(tempfile.gettempdir(), "downloads"), exist_ok=True)
 
-async def _run_bot_with_scheduler():
-    """
-    Pyrogram 2.x entry coroutine.
-    Registers the auto-update scheduler on the *live* event loop,
-    then returns so Pyrogram's idle() keeps the bot running.
-    """
-    print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
-    from scheduler import start_scheduler          # lazy import → no circular issues
-    await start_scheduler(bot)
-    print(">>> Auto-Update Scheduler loaded")
-
-
-if __name__ == "__main__":
-    # Prevent scheduler._m()'s `import main as _main` from re-executing
-    # this file as a second module when the bot is run as `python main.py`.
-    sys.modules.setdefault("main", sys.modules["__main__"])
-
-    _bootstrap()
-    bot.run(_run_bot_with_scheduler())
+print("\033[92m✓ AppX Downloader Bot starting…\033[0m")
+bot.run()
