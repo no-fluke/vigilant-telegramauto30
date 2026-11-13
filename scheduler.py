@@ -221,6 +221,25 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
     return thread_id
 
 
+# ── Peer cache primer ────────────────────────────────────────────────────────
+
+async def _prime_peer(bot, supergroup_id: int, retries: int = 3):
+    """
+    Force Pyrogram to resolve and cache the peer for supergroup_id.
+    Must be called before any send — both pyrogram and requests paths need
+    the peer in cache for flood-safe operations.
+    Exponential back-off: 1s → 2s → 4s across retries.
+    """
+    for attempt in range(retries):
+        try:
+            await bot.get_chat(supergroup_id)
+            return True
+        except Exception as e:
+            logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}: {e}")
+            await asyncio.sleep(2 ** attempt)
+    return False
+
+
 # ── Send file to topic ───────────────────────────────────────────────────────
 
 async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
@@ -228,13 +247,26 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     """
     Send a file to a supergroup forum topic.
 
-    FIX #1: parse_mode changed from "Markdown" to "HTML" so that
-    <blockquote> tags in captions render correctly, matching main.py.
+    FIX #PeerInvalid  : always prime the peer cache BEFORE choosing the
+                        upload path (not just inside the pyrogram branch).
+    FIX #parse_mode   : use HTML so <blockquote> captions render correctly.
+    FIX #small-files  : files ≤50 MB also benefit from peer priming so the
+                        requests fallback never hits PeerInvalid indirectly
+                        via flood-wait wrappers.
     """
     if not file_path or not os.path.exists(file_path):
         return
     if not display_name:
         display_name = os.path.basename(file_path)
+
+    # ── Always prime peer cache first ────────────────────────────────────
+    peer_ok = await _prime_peer(bot, supergroup_id)
+    if not peer_ok:
+        logger.error(
+            f"[Scheduler] PeerInvalid — could not resolve {supergroup_id}. "
+            "Check bot is admin in the supergroup."
+        )
+        return
 
     file_size    = os.path.getsize(file_path)
     use_pyrogram = file_size > 50 * 1024 * 1024
@@ -242,19 +274,11 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 
     try:
         if use_pyrogram:
-            # FIX #PeerInvalid: prime the peer cache with retry so first
-            # upload never raises PeerInvalid on a fresh supergroup.
-            for _attempt in range(2):
-                try:
-                    await bot.get_chat(supergroup_id)
-                    break
-                except Exception:
-                    if _attempt == 0:
-                        await asyncio.sleep(2)
             if is_video:
                 duration = _get_video_duration(file_path)
                 await _safe_send(bot.send_video(
                     supergroup_id, file_path, caption=caption,
+                    parse_mode="html",
                     reply_to_message_id=topic_id, supports_streaming=True,
                     thumb=thumb_path,
                     duration=duration,
@@ -263,6 +287,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
             else:
                 await _safe_send(bot.send_document(
                     supergroup_id, file_path, caption=caption,
+                    parse_mode="html",
                     reply_to_message_id=topic_id, file_name=display_name,
                 ))
         else:
@@ -275,39 +300,47 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                         ".html": "text/html"}
             mime = mime_map.get(ext, "application/octet-stream")
 
-            # FIX #1: parse_mode must be "HTML" — captions use <blockquote> tags
-            # FIX #duration: probe and send duration so Telegram shows correct length
             post_data = {
                 "chat_id":            supergroup_id,
                 "message_thread_id":  topic_id,
                 "caption":            caption[:1024],
-                "parse_mode":         "HTML",          # was "Markdown" — WRONG
+                "parse_mode":         "HTML",
                 "supports_streaming": "true" if is_video else "false",
             }
             if is_video:
                 post_data["duration"] = str(_get_video_duration(file_path))
 
-            with open(file_path, "rb") as f:
-                files = {field: (display_name, f, mime)}
-                if thumb_path and os.path.exists(thumb_path):
-                    with open(thumb_path, "rb") as tf:
-                        files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
-                        resp = requests.post(
-                            api_url + method,
-                            data=post_data,
-                            files=files,
-                            timeout=300
-                        ).json()
-                else:
-                    resp = requests.post(
+            def _do_upload():
+                with open(file_path, "rb") as f:
+                    files = {field: (display_name, f, mime)}
+                    if thumb_path and os.path.exists(thumb_path):
+                        with open(thumb_path, "rb") as tf:
+                            files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
+                            return requests.post(
+                                api_url + method,
+                                data=post_data, files=files, timeout=300
+                            ).json()
+                    return requests.post(
                         api_url + method,
-                        data=post_data,
-                        files=files,
-                        timeout=300
+                        data=post_data, files=files, timeout=300
                     ).json()
 
-            if not resp.get("ok"):
-                logger.error(f"[Scheduler] Send failed: {resp.get('description')}")
+            # Retry the HTTP upload up to 3 times on Telegram-side errors
+            for _attempt in range(3):
+                resp = await asyncio.get_event_loop().run_in_executor(None, _do_upload)
+                if resp.get("ok"):
+                    break
+                err = resp.get("description", "")
+                logger.error(f"[Scheduler] Send failed (attempt {_attempt + 1}): {err}")
+                if "retry after" in err.lower():
+                    wait_sec = int(re.search(r"\d+", err).group() or 5)
+                    await asyncio.sleep(wait_sec)
+                elif "peer_id_invalid" in err.lower():
+                    # Peer cache stale mid-session — re-prime and retry once
+                    await _prime_peer(bot, supergroup_id, retries=5)
+                else:
+                    break  # Non-retriable error
+
     except Exception as e:
         logger.error(f"[Scheduler] Send error: {e}")
     finally:
@@ -364,6 +397,9 @@ async def _run_auto_update(bot, doc):
 
     tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
     os.makedirs(tmp_dir, exist_ok=True)
+
+    # Prime peer cache once per job run so all sends in this run are safe
+    await _prime_peer(bot, sg_id, retries=5)
 
     async with aiohttp.ClientSession() as session:
 
@@ -998,6 +1034,25 @@ async def addauto_handler(bot: Client, m: Message):
         await m.reply_text("❌ Nothing selected.")
         return
 
+    # Step 5.5: Video Quality
+    ask = await m.reply_text(
+        "<b>🎬 Auto-Setup — Step 5.5/7 — Preferred Video Quality</b>\n\n"
+        "<code>1</code> — 1080p\n"
+        "<code>2</code> — 720p <i>(recommended)</i>\n"
+        "<code>3</code> — 480p\n"
+        "<code>4</code> — 360p\n\n"
+        "<i>Send the number, or /d for default (720p):</i>"
+    )
+    try:
+        msg = await bot.listen(chat_id=m.chat.id, timeout=60)
+    except Exception:
+        await ask.edit_text("⏰ Timed out.")
+        return
+    _q_map = {"1": "1080p", "2": "720p", "3": "480p", "4": "360p"}
+    _q_raw = (msg.text or "").strip()
+    prefer_q = _q_map.get(_q_raw, "720p") if _q_raw != "/d" else "720p"
+    await msg.delete(); await ask.delete()
+
     # Step 6: Brand
     ask = await m.reply_text(
         "<b>🏷️ Auto-Setup — Step 6/7 — Brand Name</b>\n\n"
@@ -1114,11 +1169,11 @@ async def addauto_handler(bot: Client, m: Message):
 
             if topics_docs:
                 subjects_docs.append({
-                    "subject_id":   sid,
-                    "subject_name": sname,
-                    "topics":       topics_docs,
-                    "ts_topic_map": {},       # FIX #2: subject-level, not topic-level
-                    "last_test_ids": [],      # FIX #2: subject-level seen tests
+                    "subject_id":    sid,
+                    "subject_name":  sname,
+                    "topics":        topics_docs,
+                    "ts_topic_map":  {},       # FIX #2: subject-level, not topic-level
+                    "last_test_ids": [],       # FIX #2: subject-level seen tests
                 })
 
     if not subjects_docs:
@@ -1141,7 +1196,7 @@ async def addauto_handler(bot: Client, m: Message):
         "supergroup_id":  sg_id,
         "check_time_ist": time_input,
         "brand":          brand,
-        "prefer_quality": "720p",
+        "prefer_quality": prefer_q,
         "track_lectures": track_lec,
         "track_pdfs":     track_pdf,
         "track_quizzes":  track_quiz,
@@ -1165,6 +1220,7 @@ async def addauto_handler(bot: Client, m: Message):
         f"🧵 <b>Topic threads created:</b> {total_threads}\n"
         f"📖 <b>Subjects:</b> {len(subjects_docs)}\n"
         f"🔍 <b>Tracking:</b> {' | '.join(track_labels)}\n"
+        f"🎬 <b>Quality:</b> <code>{prefer_q}</code>\n"
         f"🕒 <b>Daily at:</b> <code>{time_input}</code> IST\n"
         f"🏠 <b>Supergroup:</b> <code>{sg_id}</code>\n"
         f"🏷️ <b>Brand:</b> <code>{brand}</code>\n"
@@ -1216,6 +1272,7 @@ async def myautos_handler(bot: Client, m: Message):
             f"  📖 {', '.join(subj_names[:3])}{'…' if len(subj_names) > 3 else ''}\n"
             f"  🧵 {total_threads} topic thread(s)\n"
             f"  🔍 {' + '.join(tracks) if tracks else 'Nothing'}\n"
+            f"  🎬 Quality: <code>{doc.get('prefer_quality', '720p')}</code>\n"
             f"  🕒 <code>{doc.get('check_time_ist','?')}</code> IST | {status}\n"
             f"  🏠 <code>{doc.get('supergroup_id','?')}</code>\n"
             f"  ⏱️ Last run: {last_str}\n\n"
@@ -1327,27 +1384,37 @@ async def delauto_handler(bot: Client, m: Message):
     if choice == "1":
         removed = 0
         for subj in doc.get("subjects", []):
+            # Delete regular topic threads
             for t in subj.get("topics", []):
                 tid = t.get("topic_thread_id")
                 if tid and sg_id:
                     await _delete_topic(sg_id, tid)
                     removed += 1
-            # FIX #2: ts_topic_map is now at subject level
+                # Also delete any legacy per-topic ts_topic_map entries
+                for ts_tid in t.get("ts_topic_map", {}).values():
+                    await _delete_topic(sg_id, int(ts_tid))
+                    removed += 1
+            # Delete subject-level test-series topic threads
             for ts_tid in subj.get("ts_topic_map", {}).values():
-                await _delete_topic(sg_id, ts_tid)
+                await _delete_topic(sg_id, int(ts_tid))
                 removed += 1
         _delete_auto(uid, auto_id)
         await m.reply_text(
             f"✅ <b>Auto #{auto_id} deleted.</b>\n"
-            f"🗑️ Removed {removed} topic thread(s)."
+            f"🗑️ Removed {removed} topic thread(s) including test-series."
         )
 
     elif choice == "2":
         subjects  = doc.get("subjects", [])
         subj_text = "<b>Select subjects to remove:</b>\n\n"
         for i, s in enumerate(subjects, 1):
-            n = len(s.get("topics", []))
-            subj_text += f"<code>{i}.</code> {s['subject_name']} ({n} threads)\n"
+            n    = len(s.get("topics", []))
+            ts_n = len(s.get("ts_topic_map", {}))
+            subj_text += (
+                f"<code>{i}.</code> {s['subject_name']} "
+                f"({n} topic thread(s)"
+                f"{f', {ts_n} test-series thread(s)' if ts_n else ''})\n"
+            )
         subj_text += "\n<i>Send numbers comma-separated (e.g. <code>1,3</code>)</i>"
         await m.reply_text(subj_text)
         try:
@@ -1365,13 +1432,17 @@ async def delauto_handler(bot: Client, m: Message):
         kept_subjects = []
         for i, s in enumerate(subjects):
             if i in rm_idxs:
+                # Delete regular topic threads
                 for t in s.get("topics", []):
                     tid = t.get("topic_thread_id")
                     if tid and sg_id:
                         await _delete_topic(sg_id, tid)
-                # FIX #2: ts_topic_map at subject level
+                    # Legacy per-topic ts_topic_map
+                    for ts_tid in t.get("ts_topic_map", {}).values():
+                        await _delete_topic(sg_id, int(ts_tid))
+                # Subject-level test-series threads
                 for ts_tid in s.get("ts_topic_map", {}).values():
-                    await _delete_topic(sg_id, ts_tid)
+                    await _delete_topic(sg_id, int(ts_tid))
                 removed_names.append(s["subject_name"])
             else:
                 kept_subjects.append(s)
