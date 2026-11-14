@@ -33,6 +33,7 @@ import asyncio
 import logging
 import tempfile
 import subprocess
+import time
 import aiohttp
 import requests
 
@@ -223,42 +224,105 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
 
 # ── Peer cache primer ────────────────────────────────────────────────────────
 
-async def _prime_peer(bot, supergroup_id: int, retries: int = 3):
+async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
     """
-    Force Pyrogram to resolve and cache the peer for supergroup_id.
-    Best-effort: callers must NOT abort if this returns False, since the
-    requests-based send path doesn't need it and the pyrogram path will
-    surface its own error via _safe_send / logger.
-    Exponential back-off: 1s → 2s → 4s across retries.
+    FIX #PeerInvalid — Robustly prime Pyrogram's peer cache for a supergroup.
+
+    Strategy (matches how main.py handles channels/groups):
+      1. get_chat(supergroup_id)  — standard cache fill
+      2. If that fails, resolve via Bot-API getChat and cache manually
+      3. Exponential back-off: 1s → 2s → 4s → 8s → 16s across retries
+
+    Returns True when the peer is confirmed cached, False on total failure.
+    Callers must NOT abort on False — the Bot-API (requests) send path works
+    without Pyrogram's peer cache; only the Pyrogram large-file path needs it.
     """
     for attempt in range(retries):
         try:
-            await bot.get_chat(supergroup_id)
+            chat = await bot.get_chat(supergroup_id)
+            # Explicitly resolve/store the input peer so it's cached
+            try:
+                await bot.resolve_peer(supergroup_id)
+            except Exception:
+                pass
+            logger.info(f"[Scheduler] Peer primed: {supergroup_id} ({getattr(chat, 'title', '')})")
             return True
         except Exception as e:
-            logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}: {e}")
+            logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}/{retries}: {e}")
+            # On first failure, also try joining/fetching via Bot-API to warm up MTProto
+            if attempt == 0:
+                try:
+                    r = requests.get(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
+                        params={"chat_id": supergroup_id}, timeout=10
+                    ).json()
+                    if r.get("ok"):
+                        logger.info(f"[Scheduler] Bot-API getChat succeeded for {supergroup_id}")
+                        await asyncio.sleep(1)
+                        continue   # retry get_chat immediately after Bot-API warm-up
+                except Exception:
+                    pass
             await asyncio.sleep(2 ** attempt)
     return False
 
 
-# ── Send file to topic ───────────────────────────────────────────────────────
+# ── Progress message helpers (mirrors main.py safe_progress_edit) ─────────────
+
+async def _safe_progress_edit(bot, chat_id: int, msg, text: str, **kwargs):
+    """
+    Edit a progress message.  If it was deleted, send a new one and return it
+    so the caller can keep updating it — identical pattern to main.py.
+    """
+    try:
+        await msg.edit_text(text, **kwargs)
+        return msg
+    except Exception:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            new_msg = await bot.send_message(chat_id, text, **kwargs)
+            return new_msg
+        except Exception as e:
+            logger.error(f"[Scheduler] _safe_progress_edit send failed: {e}")
+            return msg
+
+
+def _fmt_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 ** 2:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 ** 3:
+        return f"{size_bytes / (1024**2):.1f} MB"
+    return f"{size_bytes / (1024**3):.2f} GB"
+
+
+def _make_progress_bar(current: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "░" * width
+    filled = int(width * current / total)
+    return "█" * filled + "░" * (width - filled)
+
+
+# ── Send file to topic WITH progress ─────────────────────────────────────────
 
 async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
-                         is_video=False, display_name=""):
+                         is_video=False, display_name="",
+                         progress_chat_id: int = None,
+                         progress_title: str = ""):
     """
-    Send a file to a supergroup forum topic.
+    Send a file to a supergroup forum topic, with live upload progress shown
+    in progress_chat_id (mirrors main.py's send_vid upload progress).
 
     FIX #PeerInvalid  : peer priming is ONLY done inside the pyrogram
                         (large-file) branch where Pyrogram actually needs the
                         access hash.  The requests path uses the Bot-API token
                         and never needs the Pyrogram peer cache.
-                        Crucially we do NOT return early on a failed prime —
-                        the actual send call will surface and log the error
-                        itself.  Calling _prime_peer for every file (as the
-                        previous revision did) caused rate-limit bursts and
-                        could make _prime_peer return False for a healthy
-                        supergroup, silently dropping all uploads.
+                        We do NOT return early on a failed prime.
     FIX #parse_mode   : use HTML so <blockquote> captions render correctly.
+    FIX #progress     : live upload progress bar sent to progress_chat_id.
     """
     if not file_path or not os.path.exists(file_path):
         return
@@ -269,10 +333,48 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     use_pyrogram = file_size > 50 * 1024 * 1024
     thumb_path   = _make_thumb(file_path) if is_video else None
 
+    # Progress state
+    prog_msg          = None
+    _last_edit_time   = [0.0]
+    _upload_start     = [time.time()]
+
+    async def _progress_callback(current, total):
+        """Pyrogram upload progress callback — mirrors main.py's send_vid."""
+        nonlocal prog_msg
+        now = time.time()
+        if now - _last_edit_time[0] < 3:          # throttle to 1 edit / 3s
+            return
+        _last_edit_time[0] = now
+        bar   = _make_progress_bar(current, total)
+        pct   = current * 100 // total if total else 0
+        speed = current / max(now - _upload_start[0], 0.1) / (1024 * 1024)
+        text  = (
+            f"📤 <b>Uploading…</b>\n"
+            f"<code>{display_name[:45]}</code>\n"
+            f"[{bar}] {pct}%\n"
+            f"{_fmt_size(current)} / {_fmt_size(total)} @ {speed:.1f} MB/s"
+        )
+        if prog_msg and progress_chat_id:
+            prog_msg = await _safe_progress_edit(bot, progress_chat_id, prog_msg, text)
+
     try:
         if use_pyrogram:
+            # ── Large file: Pyrogram path (needs peer cache) ──────────────
             # Prime peer cache (best-effort, no early-return on failure)
             await _prime_peer(bot, supergroup_id)
+
+            if progress_chat_id:
+                label = progress_title or display_name[:50]
+                try:
+                    prog_msg = await bot.send_message(
+                        progress_chat_id,
+                        f"📤 <b>Uploading (large file)…</b>\n<code>{label}</code>",
+                        parse_mode="html"
+                    )
+                except Exception:
+                    pass
+                _upload_start[0] = time.time()
+
             if is_video:
                 duration = _get_video_duration(file_path)
                 await _safe_send(bot.send_video(
@@ -282,14 +384,37 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                     thumb=thumb_path,
                     duration=duration,
                     width=1280, height=720,
+                    progress=_progress_callback,
                 ))
             else:
                 await _safe_send(bot.send_document(
                     supergroup_id, file_path, caption=caption,
                     parse_mode="html",
                     reply_to_message_id=topic_id, file_name=display_name,
+                    progress=_progress_callback,
                 ))
+
+            # Clean up progress message
+            if prog_msg:
+                try:
+                    await prog_msg.edit_text(f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>")
+                except Exception:
+                    pass
+
         else:
+            # ── Small file: Bot-API requests path (no peer cache needed) ──
+            if progress_chat_id:
+                label = progress_title or display_name[:50]
+                try:
+                    prog_msg = await bot.send_message(
+                        progress_chat_id,
+                        f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
+                        f"📦 Size: {_fmt_size(file_size)}",
+                        parse_mode="html"
+                    )
+                except Exception:
+                    pass
+
             api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
             method  = "sendVideo" if is_video else "sendDocument"
             field   = "video"     if is_video else "document"
@@ -336,12 +461,25 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                     await asyncio.sleep(wait_sec)
                 elif "peer_id_invalid" in err.lower():
                     # Peer cache stale mid-session — re-prime and retry once
+                    logger.warning("[Scheduler] peer_id_invalid on Bot-API path — re-priming peer")
                     await _prime_peer(bot, supergroup_id, retries=5)
                 else:
                     break  # Non-retriable error
 
+            # Clean up progress message
+            if prog_msg:
+                try:
+                    await prog_msg.edit_text(f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>")
+                except Exception:
+                    pass
+
     except Exception as e:
         logger.error(f"[Scheduler] Send error: {e}")
+        if prog_msg:
+            try:
+                await prog_msg.edit_text(f"❌ <b>Upload failed:</b> <code>{display_name[:50]}</code>\n{e}")
+            except Exception:
+                pass
     finally:
         if thumb_path and os.path.exists(thumb_path):
             try:
@@ -352,25 +490,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 
 # ════════════════════════════════════════════════════════════════════════════
 #  CORE AUTO-UPDATE JOB
-#
-#  MongoDB structure (per auto_watch doc):
-#
-#  subjects: [
-#    {
-#      subject_id, subject_name,
-#      topics: [
-#        {
-#          topic_id, topic_name,
-#          topic_thread_id,         ← Telegram forum topic ID
-#          last_lecture_ids: [],
-#          last_pdf_ids:     [],
-#          last_quiz_ids:    [],
-#          last_test_ids:    [],
-#        }
-#      ],
-#      ts_topic_map: {}             ← {series_id: thread_id}  MOVED to subject level
-#    }
-#  ]
 # ════════════════════════════════════════════════════════════════════════════
 
 async def _run_auto_update(bot, doc):
@@ -397,8 +516,28 @@ async def _run_auto_update(bot, doc):
     tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Prime peer cache once per job run so pyrogram sends in this run are safe
-    await _prime_peer(bot, sg_id, retries=5)
+    # ── FIX #PeerInvalid — Prime peer BEFORE any downloads or uploads ──────
+    # Called here once with high retries. The _send_to_topic function also
+    # calls it on the pyrogram path, but this early prime ensures the cache
+    # is warm before the first video is even downloaded.
+    peer_ok = await _prime_peer(bot, sg_id, retries=7)
+    if not peer_ok:
+        logger.warning(
+            f"[Scheduler] Could not prime peer for {sg_id} after 7 attempts. "
+            f"Bot-API (small file) path will still work; pyrogram large-file path may fail."
+        )
+
+    # Send a job-start progress message to the user (mirrors main.py run_lecture_loop)
+    prog_msg = None
+    try:
+        prog_msg = await bot.send_message(
+            user_id,
+            f"<blockquote><b>🤖 Auto #{auto_id} — {cname}</b>\n"
+            f"🔄 Checking for new content…</blockquote>",
+            parse_mode="html"
+        )
+    except Exception:
+        pass
 
     async with aiohttp.ClientSession() as session:
 
@@ -432,20 +571,22 @@ async def _run_auto_update(bot, doc):
                     )
                 except Exception:
                     pass
+                if prog_msg:
+                    try:
+                        await prog_msg.delete()
+                    except Exception:
+                        pass
                 return
 
         hdr = main.make_headers(token, appx_uid)
         updated_subjects = []
+        total_new = 0
 
         for subj in doc.get("subjects", []):
             subj_id   = str(subj["subject_id"])
             subj_name = subj["subject_name"]
             updated_topics = []
 
-            # ── FIX #2: ts_topic_map moved to subject level ──────────────
-            # Previously this was nested inside each topic_doc, causing
-            # get_test_series_list to run once per topic (duplicates).
-            # Now fetched once per subject, after all topics are processed.
             ts_topic_map = subj.get("ts_topic_map", {})
 
             for topic_doc in subj.get("topics", []):
@@ -479,6 +620,18 @@ async def _run_auto_update(bot, doc):
                     if not lec_id:
                         continue
 
+                    # ── Live progress update (mirrors run_lecture_loop) ───
+                    if prog_msg:
+                        prog_msg = await _safe_progress_edit(
+                            bot, user_id, prog_msg,
+                            f"<blockquote>"
+                            f"🤖 <b>Auto #{auto_id} — {cname}</b>\n"
+                            f"📚 {subj_name} → {topic_name}\n"
+                            f"🔍 Checking {i}/{total}: {title[:45]}"
+                            f"</blockquote>",
+                            parse_mode="html"
+                        )
+
                     # ── Captions — IDENTICAL to run_lecture_loop ─────────
                     cc = (
                         f"[🎥] <code>{str(i).zfill(3)}) {title[:60]} [{prefer_q}]</code>\n"
@@ -506,8 +659,6 @@ async def _run_auto_update(bot, doc):
                     has_quiz = is_pure_quiz or bool(raw_qid)
 
                     if has_quiz and track_quiz:
-                        # FIX #3: fall back to lec_id when raw_qid is empty,
-                        # matching main.py: quiz_id = _raw_qid or str(lec_id)
                         quiz_id = raw_qid or lec_id
                         if quiz_id and quiz_id not in seen_quiz_ids:
                             new_quiz_ids.add(quiz_id)
@@ -532,15 +683,14 @@ async def _run_auto_update(bot, doc):
                                         bot, sg_id, thread_id, qfile, q_cap,
                                         is_video=False,
                                         display_name=main.safe_filename(title) + "_quiz.html",
+                                        progress_chat_id=user_id,
+                                        progress_title=f"Quiz: {title[:40]}",
                                     )
+                                    total_new += 1
                                     try:
                                         os.remove(qfile)
                                     except Exception:
                                         pass
-                            else:
-                                logger.warning(
-                                    f"[Scheduler] Quiz qid={quiz_id} no questions"
-                                )
 
                     if is_pure_quiz:
                         continue
@@ -560,13 +710,25 @@ async def _run_auto_update(bot, doc):
                         if track_pdf and lec_id not in seen_pdf_ids:
                             new_pdf_ids.add(lec_id)
                             if url:
+                                # Show download progress
+                                if prog_msg:
+                                    prog_msg = await _safe_progress_edit(
+                                        bot, user_id, prog_msg,
+                                        f"<blockquote>⬇️ <b>Downloading PDF…</b>\n"
+                                        f"<code>{str(i).zfill(3)}) {title[:55]}</code>\n"
+                                        f"📚 {subj_name} → {topic_name}</blockquote>",
+                                        parse_mode="html"
+                                    )
                                 pr = await main.download_pdf(url, out_path)
                                 if pr and os.path.exists(pr):
                                     await _send_to_topic(
                                         bot, sg_id, thread_id, pr, cc1,
                                         is_video=False,
                                         display_name=main.safe_filename(title) + ".pdf",
+                                        progress_chat_id=user_id,
+                                        progress_title=f"PDF: {title[:40]}",
                                     )
+                                    total_new += 1
                                     try:
                                         os.remove(pr)
                                     except Exception:
@@ -594,7 +756,10 @@ async def _run_auto_update(bot, doc):
                                         display_name=main.safe_filename(
                                             f"{title}_p{idx2}"
                                         ) + ".pdf",
+                                        progress_chat_id=user_id,
+                                        progress_title=f"PDF p{idx2}: {title[:35]}",
                                     )
+                                    total_new += 1
                                     try:
                                         os.remove(pr2)
                                     except Exception:
@@ -616,15 +781,16 @@ async def _run_auto_update(bot, doc):
                                     bot, sg_id, thread_id, pr, cc1,
                                     is_video=False,
                                     display_name=main.safe_filename(title) + ".pdf",
+                                    progress_chat_id=user_id,
+                                    progress_title=f"PDF: {title[:40]}",
                                 )
+                                total_new += 1
                                 try:
                                     os.remove(pr)
                                 except Exception:
                                     pass
 
-                    # ── FIX #4: YouTube type — notify topic, skip download ─
-                    # Scheduler has no yt-dlp cookie support for auto mode.
-                    # Send a text message to the topic instead of silently skipping.
+                    # ── YouTube type — notify topic, skip download ─────────
                     if vtype == "youtube":
                         if track_lec and lec_id not in seen_lec_ids:
                             new_lec_ids.add(lec_id)
@@ -637,14 +803,12 @@ async def _run_auto_update(bot, doc):
                                     f"🔗 {url}",
                                     reply_to_message_id=thread_id,
                                 )
+                                total_new += 1
                             except Exception as e:
                                 logger.error(f"[Scheduler] YT notify error: {e}")
                         continue
 
-                    # ── FIX #5: encrypted.m URL — extract key before download
-                    # main.py splits on '*' to get appxkey when url contains
-                    # 'encrypted.m'. download_item / _download_single_url do NOT
-                    # do this split, so we must do it here before calling them.
+                    # ── encrypted.m URL — extract key before download ──────
                     if url and "encrypted.m" in url:
                         parts = url.split("*", 1)
                         url   = parts[0]
@@ -654,6 +818,20 @@ async def _run_auto_update(bot, doc):
                     # ── New video lecture ─────────────────────────────────
                     if track_lec and lec_id not in seen_lec_ids and url:
                         new_lec_ids.add(lec_id)
+
+                        # ── Download progress (mirrors run_lecture_loop) ──
+                        if prog_msg:
+                            prog_msg = await _safe_progress_edit(
+                                bot, user_id, prog_msg,
+                                f"<blockquote>"
+                                f"⬇️ <b>Downloading video…</b>\n"
+                                f"<code>{str(i).zfill(3)}) {title[:55]} [{prefer_q}]</code>\n"
+                                f"📚 {subj_name} → {topic_name}\n"
+                                f"💃 Batch: {cname}"
+                                f"</blockquote>",
+                                parse_mode="html"
+                            )
+
                         ok = await main.download_item(
                             vtitle or title, url, xor_key, vtype,
                             out_path, hdr=hdr,
@@ -668,16 +846,41 @@ async def _run_auto_update(bot, doc):
                                     vid_file = fp
                                     break
                             if vid_file:
+                                file_mb = os.path.getsize(vid_file) / (1024 * 1024)
+                                if prog_msg:
+                                    prog_msg = await _safe_progress_edit(
+                                        bot, user_id, prog_msg,
+                                        f"<blockquote>"
+                                        f"✅ <b>Downloaded!</b> ({file_mb:.1f} MB)\n"
+                                        f"<code>{title[:55]}</code>\n"
+                                        f"📤 Uploading to topic…"
+                                        f"</blockquote>",
+                                        parse_mode="html"
+                                    )
                                 vid_ext = os.path.splitext(vid_file)[-1].lstrip(".")
                                 await _send_to_topic(
                                     bot, sg_id, thread_id, vid_file, cc,
                                     is_video=True,
                                     display_name=main.safe_filename(title) + f".{vid_ext}",
+                                    progress_chat_id=user_id,
+                                    progress_title=f"Video: {title[:40]}",
                                 )
+                                total_new += 1
                                 try:
                                     os.remove(vid_file)
                                 except Exception:
                                     pass
+                        else:
+                            logger.warning(f"[Scheduler] Download failed: {title}")
+                            if prog_msg:
+                                prog_msg = await _safe_progress_edit(
+                                    bot, user_id, prog_msg,
+                                    f"<blockquote>"
+                                    f"⚠️ <b>Download failed:</b>\n"
+                                    f"<code>{title[:55]}</code>"
+                                    f"</blockquote>",
+                                    parse_mode="html"
+                                )
 
                     await asyncio.sleep(0.5)
 
@@ -685,15 +888,11 @@ async def _run_auto_update(bot, doc):
                 topic_doc["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
                 topic_doc["last_pdf_ids"]     = list(seen_pdf_ids | new_pdf_ids)
                 topic_doc["last_quiz_ids"]    = list(seen_quiz_ids | new_quiz_ids)
-                # Remove old per-topic ts_topic_map if it exists (migration)
                 topic_doc.pop("ts_topic_map", None)
                 topic_doc.pop("last_test_ids", None)
                 updated_topics.append(topic_doc)
 
-            # ── FIX #2: Test Series ONCE per subject ──────────────────────
-            # Previously inside the topic loop → ran N times and sent
-            # the same tests into every topic thread. Now runs once per
-            # subject and uses a dedicated ts_topic_map at subject level.
+            # ── Test Series ONCE per subject ──────────────────────────────
             seen_test_ids = set(subj.get("last_test_ids", []))
             new_test_ids  = set()
 
@@ -709,16 +908,11 @@ async def _run_auto_update(bot, doc):
                     if not series_id:
                         continue
 
-                    # Create / reuse a dedicated Telegram topic for this series
-                    # FIX #duplicate-threads: _get_or_create_topic checks the
-                    # map first so a topic is never created twice for the same
-                    # series_id across runs.
                     ts_thread_id = await _get_or_create_topic(
                         sg_id, f"{subj_name} — {series_name}",
                         ts_topic_map, series_id
                     )
                     if not ts_thread_id:
-                        # Fallback: use first topic thread of this subject
                         ts_thread_id = next(
                             (t.get("topic_thread_id")
                              for t in updated_topics
@@ -798,7 +992,10 @@ async def _run_auto_update(bot, doc):
                             bot, sg_id, ts_thread_id, actual_path, t_cap,
                             is_video=False,
                             display_name=main.safe_filename(test_title) + ".html",
+                            progress_chat_id=user_id,
+                            progress_title=f"Test: {test_title[:40]}",
                         )
+                        total_new += 1
                         try:
                             os.remove(actual_path)
                         except Exception:
@@ -815,7 +1012,28 @@ async def _run_auto_update(bot, doc):
             {"user_id": user_id, "auto_id": auto_id},
             {"$set": {"subjects": updated_subjects, "last_run_at": datetime.utcnow()}}
         )
-        logger.info(f"[Scheduler] ✅ Auto #{auto_id} for user {user_id} done.")
+
+        # ── Final summary to user (mirrors main.py completion message) ────
+        summary = (
+            f"<b>-┈━═.•° ✅ Auto #{auto_id} Done °•.═━┈-</b>\n"
+            f"<blockquote><b>🎯 Batch: {cname}</b>\n"
+            f"📦 New items sent: {total_new}</blockquote>"
+        )
+        if prog_msg:
+            try:
+                await prog_msg.edit_text(summary, parse_mode="html")
+            except Exception:
+                try:
+                    await bot.send_message(user_id, summary, parse_mode="html")
+                except Exception:
+                    pass
+        elif total_new > 0:
+            try:
+                await bot.send_message(user_id, summary, parse_mode="html")
+            except Exception:
+                pass
+
+        logger.info(f"[Scheduler] ✅ Auto #{auto_id} for user {user_id} done. {total_new} new items.")
 
 
 async def run_all_due_autos(bot):
@@ -1132,8 +1350,6 @@ async def addauto_handler(bot: Client, m: Message):
                 tname = t.get("topic_name", "Topic")
                 tid   = str(t.get("topicid", ""))
 
-                # FIX #duplicate-threads: reuse an existing Telegram thread if
-                # this user already has one for this topic in this supergroup.
                 thread_id = None
                 existing_auto = _aw().find_one(
                     {"user_id": uid, "supergroup_id": sg_id,
@@ -1171,8 +1387,8 @@ async def addauto_handler(bot: Client, m: Message):
                     "subject_id":    sid,
                     "subject_name":  sname,
                     "topics":        topics_docs,
-                    "ts_topic_map":  {},       # FIX #2: subject-level, not topic-level
-                    "last_test_ids": [],       # FIX #2: subject-level seen tests
+                    "ts_topic_map":  {},
+                    "last_test_ids": [],
                 })
 
     if not subjects_docs:
@@ -1325,7 +1541,7 @@ async def runnow_handler(bot: Client, m: Message):
 
     await m.reply_text(
         f"🚀 <b>Running Auto #{auto_id} — {doc['course_name']} now…</b>\n"
-        "Updates will be posted directly to the supergroup topics."
+        "Progress updates will appear below."
     )
     asyncio.create_task(_run_auto_update(bot, doc))
 
@@ -1383,22 +1599,17 @@ async def delauto_handler(bot: Client, m: Message):
     if choice == "1":
         removed = 0
         for subj in doc.get("subjects", []):
-            # Delete regular topic threads
             for t in subj.get("topics", []):
                 tid = t.get("topic_thread_id")
                 if tid and sg_id:
                     await _delete_topic(sg_id, tid)
                     removed += 1
-                # Also delete any legacy per-topic ts_topic_map entries
-                # FIX #deletion: guard int() with try/except so a bad value
-                # never aborts the loop and skips _delete_auto below.
                 for ts_tid in t.get("ts_topic_map", {}).values():
                     try:
                         await _delete_topic(sg_id, int(ts_tid))
                         removed += 1
                     except Exception:
                         pass
-            # Delete subject-level test-series topic threads
             for ts_tid in subj.get("ts_topic_map", {}).values():
                 try:
                     await _delete_topic(sg_id, int(ts_tid))
@@ -1439,20 +1650,15 @@ async def delauto_handler(bot: Client, m: Message):
         kept_subjects = []
         for i, s in enumerate(subjects):
             if i in rm_idxs:
-                # Delete regular topic threads
                 for t in s.get("topics", []):
                     tid = t.get("topic_thread_id")
                     if tid and sg_id:
                         await _delete_topic(sg_id, tid)
-                    # Legacy per-topic ts_topic_map
-                    # FIX #deletion: guard int() with try/except
                     for ts_tid in t.get("ts_topic_map", {}).values():
                         try:
                             await _delete_topic(sg_id, int(ts_tid))
                         except Exception:
                             pass
-                # Subject-level test-series threads
-                # FIX #deletion: guard int() with try/except
                 for ts_tid in s.get("ts_topic_map", {}).values():
                     try:
                         await _delete_topic(sg_id, int(ts_tid))
@@ -1482,10 +1688,6 @@ async def delauto_handler(bot: Client, m: Message):
 
 # ════════════════════════════════════════════════════════════════════════════
 #  SCHEDULER STARTUP — call once from main.py
-#
-#  Add at the bottom of main.py, before bot.run():
-#      from scheduler import start_scheduler
-#      bot.loop.run_until_complete(start_scheduler(bot))
 # ════════════════════════════════════════════════════════════════════════════
 
 async def start_scheduler(bot: Client):
