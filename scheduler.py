@@ -39,10 +39,12 @@ import requests
 
 from datetime import datetime, timezone, timedelta
 from pyromod import listen as _pyromod_listen  # patches Client with .listen()
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
+
+HTML = enums.ParseMode.HTML   # shorthand used throughout this file
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -181,54 +183,15 @@ async def _safe_send(coro):
 
 # ── AppX API rate-limit helper ───────────────────────────────────────────────
 
-APPX_API_DELAY   = 1.0   # seconds between every AppX API call (safe default)
-APPX_RETRY_DELAY = 10.0  # seconds to wait when a 429 / rate-limit is detected
-APPX_MAX_RETRIES = 4     # max retries on rate-limit before giving up
+# NOTE: All AppX API calls go through main.py's api_get() which already has:
+#   - 0.3s delay before every request
+#   - 429 detection with escalating backoff: 15s → 30s → 45s
+#   - 3 retries with 2s sleep on error
+# We do NOT add extra sleeps around those calls — that would double-hammer.
+# The only inter-call delay we keep is TOPIC_ITER_DELAY between topic iterations
+# (not between individual API calls) so the scheduler doesn't blast all topics back-to-back.
 
-async def _appx_get(session, url, headers, params=None, retries=APPX_MAX_RETRIES):
-    """
-    Wrapper for every AppX API GET request inside the scheduler.
-    - Adds a small delay before each call to avoid hammering the server.
-    - Detects 429 / rate-limit responses and backs off automatically.
-    - Returns the parsed JSON dict, or {} on total failure.
-    """
-    await asyncio.sleep(APPX_API_DELAY)
-    for attempt in range(retries):
-        try:
-            async with session.get(
-                url, headers=headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 429:
-                    retry_after = float(
-                        resp.headers.get("Retry-After", APPX_RETRY_DELAY)
-                    )
-                    logger.warning(
-                        f"[Scheduler] AppX 429 rate-limit on {url} — "
-                        f"sleeping {retry_after}s (attempt {attempt+1}/{retries})"
-                    )
-                    await asyncio.sleep(retry_after)
-                    continue
-                data = await resp.json(content_type=None)
-                # Some AppX APIs return 200 but embed a rate-limit message
-                if isinstance(data, dict):
-                    msg = str(data.get("message") or data.get("error") or "").lower()
-                    if "rate" in msg or "too many" in msg or "limit" in msg:
-                        logger.warning(
-                            f"[Scheduler] AppX soft rate-limit on {url}: {msg} — "
-                            f"sleeping {APPX_RETRY_DELAY}s (attempt {attempt+1}/{retries})"
-                        )
-                        await asyncio.sleep(APPX_RETRY_DELAY)
-                        continue
-                return data
-        except asyncio.TimeoutError:
-            logger.warning(f"[Scheduler] AppX timeout on {url} (attempt {attempt+1}/{retries})")
-            await asyncio.sleep(2 ** attempt)
-        except Exception as e:
-            logger.error(f"[Scheduler] AppX request error on {url}: {e}")
-            await asyncio.sleep(2 ** attempt)
-    logger.error(f"[Scheduler] AppX giving up on {url} after {retries} attempts")
-    return {}
+TOPIC_ITER_DELAY = 1.0   # seconds between processing each topic/subject iteration
 
 
 # ── Supergroup topic helpers ──────────────────────────────────────────────────
@@ -441,7 +404,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                     prog_msg = await bot.send_message(
                         progress_chat_id,
                         f"📤 <b>Uploading (large file)…</b>\n<code>{label}</code>",
-                        parse_mode="html"
+                        parse_mode=HTML
                     )
                 except Exception:
                     pass
@@ -451,7 +414,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 duration = _get_video_duration(file_path)
                 await _safe_send(bot.send_video(
                     supergroup_id, file_path, caption=caption,
-                    parse_mode="html",
+                    parse_mode=HTML,
                     reply_to_message_id=topic_id, supports_streaming=True,
                     thumb=thumb_path,
                     duration=duration,
@@ -461,7 +424,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
             else:
                 await _safe_send(bot.send_document(
                     supergroup_id, file_path, caption=caption,
-                    parse_mode="html",
+                    parse_mode=HTML,
                     reply_to_message_id=topic_id, file_name=display_name,
                     progress=_progress_callback,
                 ))
@@ -482,7 +445,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                         progress_chat_id,
                         f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
                         f"📦 Size: {_fmt_size(file_size)}",
-                        parse_mode="html"
+                        parse_mode=HTML
                     )
                 except Exception:
                     pass
@@ -603,7 +566,7 @@ async def _run_auto_update(bot, doc):
             user_id,
             f"<blockquote><b>🤖 Auto #{auto_id} — {cname}</b>\n"
             f"🔄 Checking for new content…</blockquote>",
-            parse_mode="html"
+            parse_mode=HTML
         )
     except Exception as e:
         logger.error(f"[Scheduler] Could not send start message to user {user_id}: {e}")
@@ -674,7 +637,6 @@ async def _run_auto_update(bot, doc):
                 new_pdf_ids   = set()
                 new_quiz_ids  = set()
 
-                await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_lectures
                 lectures = await main.get_lectures(
                     session, api_base, course_id, subj_id, topic_id, hdr
                 )
@@ -699,7 +661,7 @@ async def _run_auto_update(bot, doc):
                             f"📚 {subj_name} → {topic_name}\n"
                             f"🔍 Checking {i}/{total}: {title[:45]}"
                             f"</blockquote>",
-                            parse_mode="html"
+                            parse_mode=HTML
                         )
 
                     # ── Captions — IDENTICAL to run_lecture_loop ─────────
@@ -733,7 +695,6 @@ async def _run_auto_update(bot, doc):
                         if quiz_id and quiz_id not in seen_quiz_ids:
                             new_quiz_ids.add(quiz_id)
                             try:
-                                await asyncio.sleep(APPX_API_DELAY)  # rate-limit: before fetch_quiz
                                 questions = await main.fetch_quiz(
                                     session, api_base, quiz_id, appx_uid, hdr
                                 )
@@ -767,7 +728,6 @@ async def _run_auto_update(bot, doc):
                         continue
 
                     # ── Resolve video / PDF URL ───────────────────────────
-                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before resolve_video
                     vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
                         await main.resolve_video(
                             session, api_base, course_id, lec_id, hdr,
@@ -789,7 +749,7 @@ async def _run_auto_update(bot, doc):
                                         f"<blockquote>⬇️ <b>Downloading PDF…</b>\n"
                                         f"<code>{str(i).zfill(3)}) {title[:55]}</code>\n"
                                         f"📚 {subj_name} → {topic_name}</blockquote>",
-                                        parse_mode="html"
+                                        parse_mode=HTML
                                     )
                                 pr = await main.download_pdf(url, out_path)
                                 if pr and os.path.exists(pr):
@@ -901,7 +861,7 @@ async def _run_auto_update(bot, doc):
                                 f"📚 {subj_name} → {topic_name}\n"
                                 f"💃 Batch: {cname}"
                                 f"</blockquote>",
-                                parse_mode="html"
+                                parse_mode=HTML
                             )
 
                         ok = await main.download_item(
@@ -927,7 +887,7 @@ async def _run_auto_update(bot, doc):
                                         f"<code>{title[:55]}</code>\n"
                                         f"📤 Uploading to topic…"
                                         f"</blockquote>",
-                                        parse_mode="html"
+                                        parse_mode=HTML
                                     )
                                 vid_ext = os.path.splitext(vid_file)[-1].lstrip(".")
                                 await _send_to_topic(
@@ -951,10 +911,10 @@ async def _run_auto_update(bot, doc):
                                     f"⚠️ <b>Download failed:</b>\n"
                                     f"<code>{title[:55]}</code>"
                                     f"</blockquote>",
-                                    parse_mode="html"
+                                    parse_mode=HTML
                                 )
 
-                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: between lectures
+                    await asyncio.sleep(TOPIC_ITER_DELAY)  # brief pause between lectures
 
                 # ── Persist updated seen-ID sets ──────────────────────────
                 topic_doc["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
@@ -969,7 +929,6 @@ async def _run_auto_update(bot, doc):
             new_test_ids  = set()
 
             if track_tests:
-                await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_test_series_list
                 ts_list = await main.get_test_series_list(
                     session, api_base, appx_uid, course_id, hdr
                 )
@@ -994,7 +953,7 @@ async def _run_auto_update(bot, doc):
                         )
                         if not ts_thread_id:
                             continue
-                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_testseries_subjects
+                    await asyncio.sleep(TOPIC_ITER_DELAY)
 
                     ts_subjects = await main.get_testseries_subjects(
                         session, api_base, series_id, hdr
@@ -1025,7 +984,6 @@ async def _run_auto_update(bot, doc):
                     matched_sid = str(matched_subj.get("id") or
                                       matched_subj.get("subjectid") or
                                       matched_subj.get("subject_id", "0"))
-                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_testseries_tests
                     tests = await main.get_testseries_tests(
                         session, api_base, series_id, matched_sid, hdr
                     )
@@ -1038,7 +996,6 @@ async def _run_auto_update(bot, doc):
                             continue
                         new_test_ids.add(test_id)
 
-                        await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before fetch_testseries_questions
                         questions = await main.fetch_testseries_questions(
                             session, api_base, test, hdr
                         )
@@ -1075,7 +1032,7 @@ async def _run_auto_update(bot, doc):
                             os.remove(actual_path)
                         except Exception:
                             pass
-                        await asyncio.sleep(APPX_API_DELAY)   # rate-limit: between test items
+                        await asyncio.sleep(TOPIC_ITER_DELAY)  # brief pause between tests
 
             # ── Persist subject-level data ────────────────────────────────
             subj["topics"]        = updated_topics
@@ -1096,15 +1053,15 @@ async def _run_auto_update(bot, doc):
         )
         if prog_msg:
             try:
-                await prog_msg.edit_text(summary, parse_mode="html")
+                await prog_msg.edit_text(summary, parse_mode=HTML)
             except Exception:
                 try:
-                    await bot.send_message(user_id, summary, parse_mode="html")
+                    await bot.send_message(user_id, summary, parse_mode=HTML)
                 except Exception:
                     pass
         elif total_new > 0:
             try:
-                await bot.send_message(user_id, summary, parse_mode="html")
+                await bot.send_message(user_id, summary, parse_mode=HTML)
             except Exception:
                 pass
 
@@ -1628,7 +1585,7 @@ async def runnow_handler(bot: Client, m: Message):
                 await bot.send_message(
                     uid,
                     f"❌ <b>Auto #{auto_id} crashed:</b>\n<code>{e}</code>",
-                    parse_mode="html"
+                    parse_mode=HTML
                 )
             except Exception:
                 pass
