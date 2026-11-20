@@ -630,9 +630,10 @@ async def _run_auto_update(bot, doc):
                     updated_topics.append(topic_doc)
                     continue
 
-                seen_lec_ids  = set(topic_doc.get("last_lecture_ids", []))
-                seen_pdf_ids  = set(topic_doc.get("last_pdf_ids",     []))
-                seen_quiz_ids = set(topic_doc.get("last_quiz_ids",    []))
+                # Normalise to str so int IDs stored by main.py still match
+                seen_lec_ids  = set(str(x) for x in topic_doc.get("last_lecture_ids", []))
+                seen_pdf_ids  = set(str(x) for x in topic_doc.get("last_pdf_ids",     []))
+                seen_quiz_ids = set(str(x) for x in topic_doc.get("last_quiz_ids",    []))
                 new_lec_ids   = set()
                 new_pdf_ids   = set()
                 new_quiz_ids  = set()
@@ -643,7 +644,7 @@ async def _run_auto_update(bot, doc):
                 total = len(lectures)
 
                 for i, lec in enumerate(lectures, 1):
-                    lec_id = str(lec.get("id", ""))
+                    lec_id = str(lec.get("id") or "")   # always str for consistent seen-ID checks
                     title  = lec.get("Title") or f"Lecture_{lec_id}"
                     mat    = lec.get("material_type", "")
                     name   = main.safe_filename(title, i)
@@ -676,11 +677,10 @@ async def _run_auto_update(bot, doc):
                         f"Extracted by ➤ {brand}"
                     )
 
-                    # ── Quiz detection (same as run_lecture_loop) ─────────
+                    # ── Quiz detection — mirrors main.py run_lecture_loop exactly ──
                     QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
-                    _raw_qid_val = (lec.get("quiz_title_id") or
-                                    lec.get("quizid") or lec.get("quiz_id") or "")
-                    raw_qid = str(_raw_qid_val).strip()
+                    # Match main.py field names exactly (no "quizid" without underscore)
+                    raw_qid = str(lec.get("quiz_title_id") or lec.get("quiz_id") or "")
                     if raw_qid in ("", "0", "-1", "None", "null"):
                         raw_qid = ""
 
@@ -688,6 +688,7 @@ async def _run_auto_update(bot, doc):
                         mat.upper() in QUIZ_TYPES
                         or ("quiz" in mat.lower() and mat.upper() != "VIDEO")
                     )
+                    # Match main.py: has_quiz is true if pure quiz OR has a quiz ID
                     has_quiz = is_pure_quiz or bool(raw_qid)
 
                     if has_quiz and track_quiz:
@@ -864,6 +865,9 @@ async def _run_auto_update(bot, doc):
                                 parse_mode=HTML
                             )
 
+                        # Pass class_pdfs=[] and want_pdf=False to download_item so it
+                        # only downloads the video — we send class PDFs ourselves below
+                        # (so we can track them in seen_pdf_ids and send with proper caption).
                         ok = await main.download_item(
                             vtitle or title, url, xor_key, vtype,
                             out_path, hdr=hdr,
@@ -902,6 +906,30 @@ async def _run_auto_update(bot, doc):
                                     os.remove(vid_file)
                                 except Exception:
                                     pass
+
+                            # ── Send class PDFs attached to this video lecture ──
+                            if track_pdf and class_pdfs:
+                                for suffix, purl in class_pdfs:
+                                    if not purl:
+                                        continue
+                                    pid = f"{lec_id}{suffix}"
+                                    if pid in seen_pdf_ids:
+                                        continue
+                                    new_pdf_ids.add(pid)
+                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
+                                    if pr and os.path.exists(pr):
+                                        await _send_to_topic(
+                                            bot, sg_id, thread_id, pr, cc1,
+                                            is_video=False,
+                                            display_name=main.safe_filename(title) + ".pdf",
+                                            progress_chat_id=user_id,
+                                            progress_title=f"PDF: {title[:40]}",
+                                        )
+                                        total_new += 1
+                                        try:
+                                            os.remove(pr)
+                                        except Exception:
+                                            pass
                         else:
                             logger.warning(f"[Scheduler] Download failed: {title}")
                             if prog_msg:
@@ -913,6 +941,29 @@ async def _run_auto_update(bot, doc):
                                     f"</blockquote>",
                                     parse_mode=HTML
                                 )
+                            # Still send class PDFs even when video download fails
+                            if track_pdf and class_pdfs:
+                                for suffix, purl in class_pdfs:
+                                    if not purl:
+                                        continue
+                                    pid = f"{lec_id}{suffix}"
+                                    if pid in seen_pdf_ids:
+                                        continue
+                                    new_pdf_ids.add(pid)
+                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
+                                    if pr and os.path.exists(pr):
+                                        await _send_to_topic(
+                                            bot, sg_id, thread_id, pr, cc1,
+                                            is_video=False,
+                                            display_name=main.safe_filename(title) + ".pdf",
+                                            progress_chat_id=user_id,
+                                            progress_title=f"PDF: {title[:40]}",
+                                        )
+                                        total_new += 1
+                                        try:
+                                            os.remove(pr)
+                                        except Exception:
+                                            pass
 
                     await asyncio.sleep(TOPIC_ITER_DELAY)  # brief pause between lectures
 
@@ -925,7 +976,7 @@ async def _run_auto_update(bot, doc):
                 updated_topics.append(topic_doc)
 
             # ── Test Series ONCE per subject ──────────────────────────────
-            seen_test_ids = set(subj.get("last_test_ids", []))
+            seen_test_ids = set(str(x) for x in subj.get("last_test_ids", []))
             new_test_ids  = set()
 
             if track_tests:
