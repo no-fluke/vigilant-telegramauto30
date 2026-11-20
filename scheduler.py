@@ -167,18 +167,7 @@ def _get_video_duration(path: str) -> int:
         return 0
 
 
-# ── Flood-wait wrapper ───────────────────────────────────────────────────────
 
-async def _safe_send(coro):
-    for _ in range(5):
-        try:
-            return await coro
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value + 2)
-        except Exception as e:
-            logger.error(f"[Scheduler] Send error: {e}")
-            return None
-    return None
 
 
 # ── AppX API rate-limit helper ───────────────────────────────────────────────
@@ -364,20 +353,18 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     if not display_name:
         display_name = os.path.basename(file_path)
 
-    file_size    = os.path.getsize(file_path)
-    use_pyrogram = file_size > 50 * 1024 * 1024
-    thumb_path   = _make_thumb(file_path) if is_video else None
+    file_size  = os.path.getsize(file_path)
+    thumb_path = _make_thumb(file_path) if is_video else None
+    prog_msg   = None
 
-    # Progress state
-    prog_msg          = None
-    _last_edit_time   = [0.0]
-    _upload_start     = [time.time()]
+    # Progress callback for Pyrogram uploads
+    _last_edit_time = [0.0]
+    _upload_start   = [time.time()]
 
     async def _progress_callback(current, total):
-        """Pyrogram upload progress callback — mirrors main.py's send_vid."""
         nonlocal prog_msg
         now = time.time()
-        if now - _last_edit_time[0] < 3:          # throttle to 1 edit / 3s
+        if now - _last_edit_time[0] < 3:
             return
         _last_edit_time[0] = now
         bar   = _make_progress_bar(current, total)
@@ -393,120 +380,66 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
             prog_msg = await _safe_progress_edit(bot, progress_chat_id, prog_msg, text)
 
     try:
-        if use_pyrogram:
-            # ── Large file: Pyrogram path (needs peer cache) ──────────────
-            # Prime peer cache (best-effort, no early-return on failure)
+        if progress_chat_id:
+            label = progress_title or display_name[:50]
+            try:
+                prog_msg = await bot.send_message(
+                    progress_chat_id,
+                    f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
+                    f"📦 Size: {_fmt_size(file_size)}",
+                    parse_mode=HTML
+                )
+            except Exception:
+                pass
+        _upload_start[0] = time.time()
+        duration = _get_video_duration(file_path) if is_video else 0
+
+        from pyrogram.errors import PeerIdInvalid as _PeerIdInvalid
+        for attempt in range(4):
+            # Prime peer immediately before every send attempt —
+            # cache goes cold during long downloads
             await _prime_peer(bot, supergroup_id)
-
-            if progress_chat_id:
-                label = progress_title or display_name[:50]
-                try:
-                    prog_msg = await bot.send_message(
-                        progress_chat_id,
-                        f"📤 <b>Uploading (large file)…</b>\n<code>{label}</code>",
-                        parse_mode=HTML
+            try:
+                if is_video:
+                    await bot.send_video(
+                        supergroup_id, file_path,
+                        caption=caption, parse_mode=HTML,
+                        reply_to_message_id=topic_id,
+                        supports_streaming=True,
+                        thumb=thumb_path, duration=duration,
+                        width=1280, height=720,
+                        progress=_progress_callback,
                     )
-                except Exception:
-                    pass
-                _upload_start[0] = time.time()
-
-            if is_video:
-                duration = _get_video_duration(file_path)
-                await _safe_send(bot.send_video(
-                    supergroup_id, file_path, caption=caption,
-                    parse_mode=HTML,
-                    reply_to_message_id=topic_id, supports_streaming=True,
-                    thumb=thumb_path,
-                    duration=duration,
-                    width=1280, height=720,
-                    progress=_progress_callback,
-                ))
-            else:
-                await _safe_send(bot.send_document(
-                    supergroup_id, file_path, caption=caption,
-                    parse_mode=HTML,
-                    reply_to_message_id=topic_id, file_name=display_name,
-                    progress=_progress_callback,
-                ))
-
-            # Clean up progress message
-            if prog_msg:
-                try:
-                    await prog_msg.edit_text(f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>")
-                except Exception:
-                    pass
-
-        else:
-            # ── Small file: Bot-API requests path (no peer cache needed) ──
-            if progress_chat_id:
-                label = progress_title or display_name[:50]
-                try:
-                    prog_msg = await bot.send_message(
-                        progress_chat_id,
-                        f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
-                        f"📦 Size: {_fmt_size(file_size)}",
-                        parse_mode=HTML
-                    )
-                except Exception:
-                    pass
-
-            api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/"
-            method  = "sendVideo" if is_video else "sendDocument"
-            field   = "video"     if is_video else "document"
-            ext     = os.path.splitext(display_name)[-1].lower()
-            mime_map = {".pdf": "application/pdf", ".mp4": "video/mp4",
-                        ".mkv": "video/x-matroska", ".webm": "video/webm",
-                        ".html": "text/html"}
-            mime = mime_map.get(ext, "application/octet-stream")
-
-            post_data = {
-                "chat_id":            supergroup_id,
-                "message_thread_id":  topic_id,
-                "caption":            caption[:1024],
-                "parse_mode":         "HTML",
-                "supports_streaming": "true" if is_video else "false",
-            }
-            if is_video:
-                post_data["duration"] = str(_get_video_duration(file_path))
-
-            def _do_upload():
-                with open(file_path, "rb") as f:
-                    files = {field: (display_name, f, mime)}
-                    if thumb_path and os.path.exists(thumb_path):
-                        with open(thumb_path, "rb") as tf:
-                            files["thumbnail"] = ("thumb.jpg", tf, "image/jpeg")
-                            return requests.post(
-                                api_url + method,
-                                data=post_data, files=files, timeout=300
-                            ).json()
-                    return requests.post(
-                        api_url + method,
-                        data=post_data, files=files, timeout=300
-                    ).json()
-
-            # Retry the HTTP upload up to 3 times on Telegram-side errors
-            for _attempt in range(3):
-                resp = await asyncio.get_event_loop().run_in_executor(None, _do_upload)
-                if resp.get("ok"):
-                    break
-                err = resp.get("description", "")
-                logger.error(f"[Scheduler] Send failed (attempt {_attempt + 1}): {err}")
-                if "retry after" in err.lower():
-                    wait_sec = int(re.search(r"\d+", err).group() or 5)
-                    await asyncio.sleep(wait_sec)
-                elif "peer_id_invalid" in err.lower():
-                    # Peer cache stale mid-session — re-prime and retry once
-                    logger.warning("[Scheduler] peer_id_invalid on Bot-API path — re-priming peer")
-                    await _prime_peer(bot, supergroup_id, retries=5)
                 else:
-                    break  # Non-retriable error
+                    await bot.send_document(
+                        supergroup_id, file_path,
+                        caption=caption, parse_mode=HTML,
+                        reply_to_message_id=topic_id,
+                        file_name=display_name,
+                        progress=_progress_callback,
+                    )
+                logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
+                break  # success
+            except FloodWait as fw:
+                logger.warning(f"[Scheduler] FloodWait {fw.value}s on upload attempt {attempt+1}")
+                await asyncio.sleep(fw.value + 2)
+            except _PeerIdInvalid:
+                logger.warning(
+                    f"[Scheduler] PeerIdInvalid on attempt {attempt+1} — will re-prime on next attempt"
+                )
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
+                await asyncio.sleep(5)
 
-            # Clean up progress message
-            if prog_msg:
-                try:
-                    await prog_msg.edit_text(f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>")
-                except Exception:
-                    pass
+        if prog_msg:
+            try:
+                await prog_msg.edit_text(
+                    f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>",
+                    parse_mode=HTML
+                )
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error(f"[Scheduler] Send error: {e}")
