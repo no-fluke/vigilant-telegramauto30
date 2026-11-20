@@ -228,18 +228,30 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
     """
     FIX #PeerInvalid — Robustly prime Pyrogram's peer cache for a supergroup.
 
-    Strategy (matches how main.py handles channels/groups):
-      1. get_chat(supergroup_id)  — standard cache fill
-      2. If that fails, resolve via Bot-API getChat and cache manually
-      3. Exponential back-off: 1s → 2s → 4s → 8s → 16s across retries
+    KEY FIX: Use str(supergroup_id) instead of the raw int.
+    Pyrogram's get_chat(int) tries InputPeerChannel(channel_id, access_hash)
+    which requires the access_hash to already be cached — causing PeerInvalid
+    in a cold session. get_chat(str) strips the -100 prefix and calls
+    channels.GetChannels with just the channel_id, which Telegram resolves
+    and returns the full peer (including access_hash), seeding the cache.
+
+    Strategy:
+      1. get_chat(str(supergroup_id))  — seeds cache via channels.GetChannels
+      2. resolve_peer(supergroup_id)   — confirm access_hash is stored
+      3. If that fails, warm up via Bot-API getChat then retry
+      4. Exponential back-off: 1s → 2s → 4s → 8s across retries
 
     Returns True when the peer is confirmed cached, False on total failure.
     Callers must NOT abort on False — the Bot-API (requests) send path works
     without Pyrogram's peer cache; only the Pyrogram large-file path needs it.
     """
+    # Use string form — Pyrogram resolves "-100XXXXXXXXX" via channels.GetChannels
+    # which works even in a cold session (no access_hash needed up front).
+    sg_str = str(supergroup_id)
+
     for attempt in range(retries):
         try:
-            chat = await bot.get_chat(supergroup_id)
+            chat = await bot.get_chat(sg_str)
             # Explicitly resolve/store the input peer so it's cached
             try:
                 await bot.resolve_peer(supergroup_id)
@@ -249,7 +261,7 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
             return True
         except Exception as e:
             logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}/{retries}: {e}")
-            # On first failure, also try joining/fetching via Bot-API to warm up MTProto
+            # On first failure, also try warming up via Bot-API
             if attempt == 0:
                 try:
                     r = requests.get(
@@ -260,8 +272,16 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
                         logger.info(f"[Scheduler] Bot-API getChat succeeded for {supergroup_id}")
                         await asyncio.sleep(1)
                         continue   # retry get_chat immediately after Bot-API warm-up
-                except Exception:
-                    pass
+                    else:
+                        # Bot-API itself failed — bot is not in the group or wrong ID
+                        logger.error(
+                            f"[Scheduler] Bot-API getChat FAILED for {supergroup_id}: "
+                            f"{r.get('description', 'unknown error')} — "
+                            f"check bot is admin in the supergroup."
+                        )
+                        return False  # No point retrying — bot cannot access the group
+                except Exception as ex:
+                    logger.error(f"[Scheduler] Bot-API getChat request error: {ex}")
             await asyncio.sleep(2 ** attempt)
     return False
 
