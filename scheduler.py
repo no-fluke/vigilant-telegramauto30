@@ -179,6 +179,58 @@ async def _safe_send(coro):
     return None
 
 
+# ── AppX API rate-limit helper ───────────────────────────────────────────────
+
+APPX_API_DELAY   = 1.0   # seconds between every AppX API call (safe default)
+APPX_RETRY_DELAY = 10.0  # seconds to wait when a 429 / rate-limit is detected
+APPX_MAX_RETRIES = 4     # max retries on rate-limit before giving up
+
+async def _appx_get(session, url, headers, params=None, retries=APPX_MAX_RETRIES):
+    """
+    Wrapper for every AppX API GET request inside the scheduler.
+    - Adds a small delay before each call to avoid hammering the server.
+    - Detects 429 / rate-limit responses and backs off automatically.
+    - Returns the parsed JSON dict, or {} on total failure.
+    """
+    await asyncio.sleep(APPX_API_DELAY)
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                url, headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status == 429:
+                    retry_after = float(
+                        resp.headers.get("Retry-After", APPX_RETRY_DELAY)
+                    )
+                    logger.warning(
+                        f"[Scheduler] AppX 429 rate-limit on {url} — "
+                        f"sleeping {retry_after}s (attempt {attempt+1}/{retries})"
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                data = await resp.json(content_type=None)
+                # Some AppX APIs return 200 but embed a rate-limit message
+                if isinstance(data, dict):
+                    msg = str(data.get("message") or data.get("error") or "").lower()
+                    if "rate" in msg or "too many" in msg or "limit" in msg:
+                        logger.warning(
+                            f"[Scheduler] AppX soft rate-limit on {url}: {msg} — "
+                            f"sleeping {APPX_RETRY_DELAY}s (attempt {attempt+1}/{retries})"
+                        )
+                        await asyncio.sleep(APPX_RETRY_DELAY)
+                        continue
+                return data
+        except asyncio.TimeoutError:
+            logger.warning(f"[Scheduler] AppX timeout on {url} (attempt {attempt+1}/{retries})")
+            await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"[Scheduler] AppX request error on {url}: {e}")
+            await asyncio.sleep(2 ** attempt)
+    logger.error(f"[Scheduler] AppX giving up on {url} after {retries} attempts")
+    return {}
+
+
 # ── Supergroup topic helpers ──────────────────────────────────────────────────
 
 async def _create_topic(supergroup_id: int, name: str):
@@ -536,10 +588,7 @@ async def _run_auto_update(bot, doc):
     tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # ── FIX #PeerInvalid — Prime peer BEFORE any downloads or uploads ──────
-    # Called here once with high retries. The _send_to_topic function also
-    # calls it on the pyrogram path, but this early prime ensures the cache
-    # is warm before the first video is even downloaded.
+    # ── Prime peer cache (string form fixes PeerInvalid in cold sessions) ──
     peer_ok = await _prime_peer(bot, sg_id, retries=7)
     if not peer_ok:
         logger.warning(
@@ -547,7 +596,7 @@ async def _run_auto_update(bot, doc):
             f"Bot-API (small file) path will still work; pyrogram large-file path may fail."
         )
 
-    # Send a job-start progress message to the user (mirrors main.py run_lecture_loop)
+    # ── Send job-start progress message to user ───────────────────────────
     prog_msg = None
     try:
         prog_msg = await bot.send_message(
@@ -556,8 +605,8 @@ async def _run_auto_update(bot, doc):
             f"🔄 Checking for new content…</blockquote>",
             parse_mode="html"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"[Scheduler] Could not send start message to user {user_id}: {e}")
 
     async with aiohttp.ClientSession() as session:
 
@@ -625,6 +674,7 @@ async def _run_auto_update(bot, doc):
                 new_pdf_ids   = set()
                 new_quiz_ids  = set()
 
+                await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_lectures
                 lectures = await main.get_lectures(
                     session, api_base, course_id, subj_id, topic_id, hdr
                 )
@@ -683,6 +733,7 @@ async def _run_auto_update(bot, doc):
                         if quiz_id and quiz_id not in seen_quiz_ids:
                             new_quiz_ids.add(quiz_id)
                             try:
+                                await asyncio.sleep(APPX_API_DELAY)  # rate-limit: before fetch_quiz
                                 questions = await main.fetch_quiz(
                                     session, api_base, quiz_id, appx_uid, hdr
                                 )
@@ -716,6 +767,7 @@ async def _run_auto_update(bot, doc):
                         continue
 
                     # ── Resolve video / PDF URL ───────────────────────────
+                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before resolve_video
                     vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
                         await main.resolve_video(
                             session, api_base, course_id, lec_id, hdr,
@@ -902,7 +954,7 @@ async def _run_auto_update(bot, doc):
                                     parse_mode="html"
                                 )
 
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: between lectures
 
                 # ── Persist updated seen-ID sets ──────────────────────────
                 topic_doc["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
@@ -917,6 +969,7 @@ async def _run_auto_update(bot, doc):
             new_test_ids  = set()
 
             if track_tests:
+                await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_test_series_list
                 ts_list = await main.get_test_series_list(
                     session, api_base, appx_uid, course_id, hdr
                 )
@@ -941,7 +994,7 @@ async def _run_auto_update(bot, doc):
                         )
                         if not ts_thread_id:
                             continue
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_testseries_subjects
 
                     ts_subjects = await main.get_testseries_subjects(
                         session, api_base, series_id, hdr
@@ -972,6 +1025,7 @@ async def _run_auto_update(bot, doc):
                     matched_sid = str(matched_subj.get("id") or
                                       matched_subj.get("subjectid") or
                                       matched_subj.get("subject_id", "0"))
+                    await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before get_testseries_tests
                     tests = await main.get_testseries_tests(
                         session, api_base, series_id, matched_sid, hdr
                     )
@@ -984,6 +1038,7 @@ async def _run_auto_update(bot, doc):
                             continue
                         new_test_ids.add(test_id)
 
+                        await asyncio.sleep(APPX_API_DELAY)   # rate-limit: before fetch_testseries_questions
                         questions = await main.fetch_testseries_questions(
                             session, api_base, test, hdr
                         )
@@ -1020,7 +1075,7 @@ async def _run_auto_update(bot, doc):
                             os.remove(actual_path)
                         except Exception:
                             pass
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(APPX_API_DELAY)   # rate-limit: between test items
 
             # ── Persist subject-level data ────────────────────────────────
             subj["topics"]        = updated_topics
@@ -1563,7 +1618,22 @@ async def runnow_handler(bot: Client, m: Message):
         f"🚀 <b>Running Auto #{auto_id} — {doc['course_name']} now…</b>\n"
         "Progress updates will appear below."
     )
-    asyncio.create_task(_run_auto_update(bot, doc))
+
+    async def _run_and_catch():
+        try:
+            await _run_auto_update(bot, doc)
+        except Exception as e:
+            logger.error(f"[Scheduler] /runnow crashed for auto #{auto_id}: {e}", exc_info=True)
+            try:
+                await bot.send_message(
+                    uid,
+                    f"❌ <b>Auto #{auto_id} crashed:</b>\n<code>{e}</code>",
+                    parse_mode="html"
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_run_and_catch())
 
 
 # ════════════════════════════════════════════════════════════════════════════
