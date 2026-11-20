@@ -232,16 +232,25 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
     """
     FIX #PeerInvalid — Robustly prime Pyrogram's peer cache for a supergroup.
 
-    KEY FIX: Use str(supergroup_id) instead of the raw int.
-    Pyrogram's get_chat(int) tries InputPeerChannel(channel_id, access_hash)
-    which requires the access_hash to already be cached — causing PeerInvalid
-    in a cold session. get_chat(str) strips the -100 prefix and calls
-    channels.GetChannels with just the channel_id, which Telegram resolves
-    and returns the full peer (including access_hash), seeding the cache.
+    ROOT CAUSE (why the old version still got PeerIdInvalid):
+      get_chat(str)   → makes channels.GetChannels RPC, Telegram returns the
+                        full Channel object including access_hash, BUT Pyrogram
+                        only stores it in its peer cache when resolve_peer()
+                        is called — not automatically from get_chat alone.
+      resolve_peer(int) → goes straight to storage.get_peer_by_id(int) with
+                          no live RPC — fails immediately if cache is cold.
+      resolve_peer(str) → parses "-100XXXXXXXXX", makes a live
+                          channels.GetChannels RPC, gets the full peer WITH
+                          access_hash, and WRITES it into storage. This is the
+                          call that actually seeds the cache.
+
+    FIX: call resolve_peer(sg_str) — string form — not resolve_peer(int).
+         send_video/send_document can still use the raw int afterwards because
+         the InputPeer with access_hash is now in storage.
 
     Strategy:
-      1. get_chat(str(supergroup_id))  — seeds cache via channels.GetChannels
-      2. resolve_peer(supergroup_id)   — confirm access_hash is stored
+      1. get_chat(sg_str)       — warms Pyrogram's internal channel object
+      2. resolve_peer(sg_str)   — THE FIX: writes InputPeer+access_hash to storage
       3. If that fails, warm up via Bot-API getChat then retry
       4. Exponential back-off: 1s → 2s → 4s → 8s across retries
 
@@ -249,19 +258,25 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
     Callers must NOT abort on False — the Bot-API (requests) send path works
     without Pyrogram's peer cache; only the Pyrogram large-file path needs it.
     """
-    # Use string form — Pyrogram resolves "-100XXXXXXXXX" via channels.GetChannels
-    # which works even in a cold session (no access_hash needed up front).
+    # String form: Pyrogram parses "-100XXXXXXXXX" and resolves via
+    # channels.GetChannels — no access_hash needed up front.
     sg_str = str(supergroup_id)
 
     for attempt in range(retries):
         try:
+            # Step 1: get_chat with string — triggers channels.GetChannels RPC
             chat = await bot.get_chat(sg_str)
-            # Explicitly resolve/store the input peer so it's cached
-            try:
-                await bot.resolve_peer(supergroup_id)
-            except Exception:
-                pass
-            logger.info(f"[Scheduler] Peer primed: {supergroup_id} ({getattr(chat, 'title', '')})")
+
+            # Step 2: THE REAL FIX — resolve_peer with STRING, not int.
+            # resolve_peer(str) makes a live RPC and writes the InputPeer
+            # (with access_hash) into Pyrogram's storage.
+            # resolve_peer(int) only reads from storage — useless if cold.
+            peer = await bot.resolve_peer(sg_str)
+
+            logger.info(
+                f"[Scheduler] Peer primed: {supergroup_id} "
+                f"({getattr(chat, 'title', '')}) → {peer}"
+            )
             return True
         except Exception as e:
             logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}/{retries}: {e}")
@@ -273,9 +288,9 @@ async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
                         params={"chat_id": supergroup_id}, timeout=10
                     ).json()
                     if r.get("ok"):
-                        logger.info(f"[Scheduler] Bot-API getChat succeeded for {supergroup_id}")
+                        logger.info(f"[Scheduler] Bot-API getChat warm-up succeeded for {supergroup_id}")
                         await asyncio.sleep(1)
-                        continue   # retry get_chat immediately after Bot-API warm-up
+                        continue   # retry immediately after Bot-API warm-up
                     else:
                         # Bot-API itself failed — bot is not in the group or wrong ID
                         logger.error(
