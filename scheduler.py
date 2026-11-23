@@ -230,78 +230,31 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
 
 async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
     """
-    FIX #PeerInvalid — Robustly prime Pyrogram's peer cache for a supergroup.
+    Prime Pyrogram's peer cache so send_video/send_document work without PeerIdInvalid.
 
-    ROOT CAUSE (why the old version still got PeerIdInvalid):
-      get_chat(str)   → makes channels.GetChannels RPC, Telegram returns the
-                        full Channel object including access_hash, BUT Pyrogram
-                        only stores it in its peer cache when resolve_peer()
-                        is called — not automatically from get_chat alone.
-      resolve_peer(int) → goes straight to storage.get_peer_by_id(int) with
-                          no live RPC — fails immediately if cache is cold.
-      resolve_peer(str) → parses "-100XXXXXXXXX", makes a live
-                          channels.GetChannels RPC, gets the full peer WITH
-                          access_hash, and WRITES it into storage. This is the
-                          call that actually seeds the cache.
+    The only reliable way to seed the cache is resolve_peer() — it fetches the
+    peer AND writes the access_hash into Pyrogram's SQLite storage. We must call
+    it with the STRING form ("-100XXXXXXXXX") because resolve_peer(int) tries to
+    look up an already-cached access_hash (chicken-and-egg). resolve_peer(str)
+    strips the -100 prefix and calls channels.GetChannels which Telegram resolves
+    fresh, returning the full peer including access_hash, which Pyrogram then stores.
 
-    FIX: call resolve_peer(sg_str) — string form — not resolve_peer(int).
-         send_video/send_document can still use the raw int afterwards because
-         the InputPeer with access_hash is now in storage.
-
-    Strategy:
-      1. get_chat(sg_str)       — warms Pyrogram's internal channel object
-      2. resolve_peer(sg_str)   — THE FIX: writes InputPeer+access_hash to storage
-      3. If that fails, warm up via Bot-API getChat then retry
-      4. Exponential back-off: 1s → 2s → 4s → 8s across retries
-
-    Returns True when the peer is confirmed cached, False on total failure.
-    Callers must NOT abort on False — the Bot-API (requests) send path works
-    without Pyrogram's peer cache; only the Pyrogram large-file path needs it.
+    After resolve_peer(str) succeeds, resolve_peer(int) will also work because the
+    access_hash is now in storage — confirming the cache is properly seeded.
     """
-    # String form: Pyrogram parses "-100XXXXXXXXX" and resolves via
-    # channels.GetChannels — no access_hash needed up front.
-    sg_str = str(supergroup_id)
+    sg_str = str(supergroup_id)   # e.g. "-1003890473236"
 
     for attempt in range(retries):
         try:
-            # Step 1: get_chat with string — triggers channels.GetChannels RPC
-            chat = await bot.get_chat(sg_str)
-
-            # Step 2: THE REAL FIX — resolve_peer with STRING, not int.
-            # resolve_peer(str) makes a live RPC and writes the InputPeer
-            # (with access_hash) into Pyrogram's storage.
-            # resolve_peer(int) only reads from storage — useless if cold.
+            # Step 1: resolve_peer with STRING — fetches + stores access_hash
             peer = await bot.resolve_peer(sg_str)
-
-            logger.info(
-                f"[Scheduler] Peer primed: {supergroup_id} "
-                f"({getattr(chat, 'title', '')}) → {peer}"
-            )
+            # Step 2: confirm integer form also resolves (storage is seeded)
+            await bot.resolve_peer(supergroup_id)
+            logger.info(f"[Scheduler] Peer primed OK: {supergroup_id} peer={peer}")
             return True
         except Exception as e:
-            logger.warning(f"[Scheduler] _prime_peer attempt {attempt + 1}/{retries}: {e}")
-            # On first failure, also try warming up via Bot-API
-            if attempt == 0:
-                try:
-                    r = requests.get(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/getChat",
-                        params={"chat_id": supergroup_id}, timeout=10
-                    ).json()
-                    if r.get("ok"):
-                        logger.info(f"[Scheduler] Bot-API getChat warm-up succeeded for {supergroup_id}")
-                        await asyncio.sleep(1)
-                        continue   # retry immediately after Bot-API warm-up
-                    else:
-                        # Bot-API itself failed — bot is not in the group or wrong ID
-                        logger.error(
-                            f"[Scheduler] Bot-API getChat FAILED for {supergroup_id}: "
-                            f"{r.get('description', 'unknown error')} — "
-                            f"check bot is admin in the supergroup."
-                        )
-                        return False  # No point retrying — bot cannot access the group
-                except Exception as ex:
-                    logger.error(f"[Scheduler] Bot-API getChat request error: {ex}")
-            await asyncio.sleep(2 ** attempt)
+            logger.warning(f"[Scheduler] _prime_peer attempt {attempt+1}/{retries}: {e}")
+            await asyncio.sleep(2 ** attempt)   # 1s, 2s, 4s, 8s, 16s
     return False
 
 
@@ -409,11 +362,21 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         _upload_start[0] = time.time()
         duration = _get_video_duration(file_path) if is_video else 0
 
+        # Send a small message to the topic first — this forces Pyrogram to
+        # resolve and cache the peer (access_hash) as a side effect of a real
+        # send. Much more reliable than get_chat/resolve_peer on a cold session.
+        _warmup_msg = None
+        try:
+            _warmup_msg = await bot.send_message(
+                supergroup_id, "⏳",
+                reply_to_message_id=topic_id,
+            )
+        except Exception as e:
+            logger.warning(f"[Scheduler] Warmup message failed: {e} — trying _prime_peer")
+            await _prime_peer(bot, supergroup_id)
+
         from pyrogram.errors import PeerIdInvalid as _PeerIdInvalid
         for attempt in range(4):
-            # Prime peer immediately before every send attempt —
-            # cache goes cold during long downloads
-            await _prime_peer(bot, supergroup_id)
             try:
                 if is_video:
                     await bot.send_video(
@@ -439,13 +402,25 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 logger.warning(f"[Scheduler] FloodWait {fw.value}s on upload attempt {attempt+1}")
                 await asyncio.sleep(fw.value + 2)
             except _PeerIdInvalid:
-                logger.warning(
-                    f"[Scheduler] PeerIdInvalid on attempt {attempt+1} — will re-prime on next attempt"
-                )
+                logger.warning(f"[Scheduler] PeerIdInvalid on attempt {attempt+1} — re-sending warmup")
+                try:
+                    _warmup_msg2 = await bot.send_message(
+                        supergroup_id, "⏳", reply_to_message_id=topic_id
+                    )
+                    await bot.delete_messages(supergroup_id, _warmup_msg2.id)
+                except Exception:
+                    await _prime_peer(bot, supergroup_id)
                 await asyncio.sleep(3)
             except Exception as e:
                 logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
                 await asyncio.sleep(5)
+
+        # Delete the warmup message now that upload is done
+        if _warmup_msg:
+            try:
+                await bot.delete_messages(supergroup_id, _warmup_msg.id)
+            except Exception:
+                pass
 
         if prog_msg:
             try:
