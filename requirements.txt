@@ -24,3 +24,4 @@ Werkzeug==2.3.7
 # ─── Stability fix ─────────────────────────────────────────────────────────────
 setuptools<81
 apscheduler
+telethon
