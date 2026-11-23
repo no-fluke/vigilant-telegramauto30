@@ -342,14 +342,11 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     try:
         tl = await _get_tl_client()
 
-        # ── devgagantools progress bar wrapper ────────────────────────────
-        # fast_upload accepts a progress_bar_function(done, total) → str
-        # We wrap it to also edit the Pyrogram progress message.
-        _last_edit = [0.0]
-        _start     = [time.time()]
+        # ── Progress state shared between fast_upload callback and edit loop ──
+        _progress_state = [0, file_size]  # [done, total]
+        _start          = [time.time()]
 
         def _pgbar(done, total):
-            # Build the display string (devgagantools calls this every chunk)
             bar   = _make_progress_bar(done, total)
             pct   = done * 100 // total if total else 0
             speed = done / max(time.time() - _start[0], 0.1) / (1024 * 1024)
@@ -360,35 +357,40 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 f"{_fmt_size(done)} / {_fmt_size(total)} @ {speed:.1f} MB/s"
             )
 
-        # Pyrogram message edit is async but devgagantools progress_bar_function
-        # is sync — use a background task with throttling to update the message.
+        # FIX #progress-not-showing: fast_upload skips progress_bar_function
+        # entirely when reply=None. Instead we use Telethon's native
+        # progress_callback on send_file which always fires, and update
+        # _progress_state from it so the async edit_loop can render it.
+        def _tl_progress(done, total):
+            _progress_state[0] = done
+            _progress_state[1] = total
+
+        # Background task: edits the Pyrogram message every 3 s.
+        # Runs during both fast_upload (upload phase) and tl.send_file (send phase).
         async def _edit_loop():
             nonlocal prog_msg
             while True:
                 await asyncio.sleep(3)
-                # The loop exits when fast_upload finishes (task is cancelled)
                 if prog_msg and progress_chat_id:
                     try:
-                        now = time.time()
-                        # Read last known progress from shared state
                         done  = _progress_state[0]
                         total = _progress_state[1]
-                        if total > 0:
-                            text = _pgbar(done, total)
+                        if total > 0 and done > 0:
                             prog_msg = await _safe_progress_edit(
-                                bot, progress_chat_id, prog_msg, text, parse_mode=HTML
+                                bot, progress_chat_id, prog_msg,
+                                _pgbar(done, total), parse_mode=HTML
                             )
                     except Exception:
                         pass
 
-        _progress_state = [0, file_size]
-
+        # Wrapper for fast_upload's progress_bar_function — also updates state
+        # so the edit_loop shows something even if fast_upload does call it.
         def _pgbar_with_state(done, total):
             _progress_state[0] = done
             _progress_state[1] = total
             return _pgbar(done, total)
 
-        # Start background edit loop
+        # Start background edit loop — covers both upload and send phases
         edit_task = asyncio.create_task(_edit_loop())
 
         try:
@@ -410,48 +412,80 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 
         logger.info(f"[Scheduler] Fast upload done: {display_name} ({_fmt_size(file_size)})")
 
-        # ── Send via Telethon using the uploaded file handle ──────────────
-        # Telethon resolves supergroup_id (int) automatically — no PeerIdInvalid.
-        for attempt in range(4):
-            try:
-                if is_video:
-                    _duration = _get_video_duration(file_path)
-                    _vid_attrs = [DocumentAttributeVideo(
-                        duration=_duration,
-                        w=1280,
-                        h=720,
-                        supports_streaming=True,
-                    )] if _duration else None
-                    await tl.send_file(
-                        supergroup_id,
-                        uploaded_file,          # pre-uploaded InputFile handle
-                        caption=caption,
-                        parse_mode="html",
-                        reply_to=topic_id,
-                        supports_streaming=True,
-                        thumb=thumb_path,
-                        video_note=False,
-                        duration=_duration or None,
-                        attributes=_vid_attrs,
-                    )
-                else:
-                    await tl.send_file(
-                        supergroup_id,
-                        uploaded_file,          # pre-uploaded InputFile handle
-                        caption=caption,
-                        parse_mode="html",
-                        reply_to=topic_id,
-                        force_document=True,
-                    )
-                logger.info(f"[Scheduler] Sent to topic: {display_name}")
-                break
+        # ── Compute video duration once, before the retry loop ───────────
+        # FIX #pdf-fail: computing _duration inside the loop and passing
+        # attributes=None / duration=None explicitly to tl.send_file caused
+        # Telethon to strip all auto-generated document attributes, which
+        # broke the uploaded file's media-type declaration and made Telegram
+        # reject subsequent sends (including PDFs that share the same client).
+        # Solution: compute duration once outside the loop; never pass
+        # attributes or duration when their value would be None/0.
+        _duration  = _get_video_duration(file_path) if is_video else 0
+        _vid_attrs = (
+            [DocumentAttributeVideo(
+                duration=_duration,
+                w=1280,
+                h=720,
+                supports_streaming=True,
+            )]
+            if is_video and _duration
+            else []          # empty list → Telethon uses its own defaults
+        )
 
-            except FloodWaitError as fw:
-                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on send attempt {attempt+1}")
-                await asyncio.sleep(fw.seconds + 2)
-            except Exception as e:
-                logger.error(f"[Scheduler] Send error attempt {attempt+1}: {e}")
-                await asyncio.sleep(5)
+        # Reset progress state for the send phase so the edit loop shows it
+        _progress_state[0] = 0
+        _progress_state[1] = file_size
+        _start[0]          = time.time()
+        edit_task = asyncio.create_task(_edit_loop())
+
+        try:
+            # ── Send via Telethon using the uploaded file handle ──────────
+            # Telethon resolves supergroup_id (int) automatically — no PeerIdInvalid.
+            for attempt in range(4):
+                try:
+                    if is_video:
+                        send_kwargs = dict(
+                            caption=caption,
+                            parse_mode="html",
+                            reply_to=topic_id,
+                            supports_streaming=True,
+                            thumb=thumb_path,
+                            video_note=False,
+                            # FIX: only pass duration/attributes when we have real values
+                            **({"duration": _duration} if _duration else {}),
+                            **({"attributes": _vid_attrs} if _vid_attrs else {}),
+                        )
+                        await tl.send_file(
+                            supergroup_id,
+                            uploaded_file,
+                            progress_callback=_tl_progress,  # FIX #progress-not-showing
+                            **send_kwargs,
+                        )
+                    else:
+                        await tl.send_file(
+                            supergroup_id,
+                            uploaded_file,
+                            caption=caption,
+                            parse_mode="html",
+                            reply_to=topic_id,
+                            force_document=True,
+                            progress_callback=_tl_progress,  # FIX #progress-not-showing
+                        )
+                    logger.info(f"[Scheduler] Sent to topic: {display_name}")
+                    break
+
+                except FloodWaitError as fw:
+                    logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on send attempt {attempt+1}")
+                    await asyncio.sleep(fw.seconds + 2)
+                except Exception as e:
+                    logger.error(f"[Scheduler] Send error attempt {attempt+1}: {e}")
+                    await asyncio.sleep(5)
+        finally:
+            edit_task.cancel()
+            try:
+                await edit_task
+            except asyncio.CancelledError:
+                pass
 
         # ── Done ──────────────────────────────────────────────────────────
         if prog_msg:
