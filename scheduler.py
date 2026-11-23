@@ -244,8 +244,6 @@ async def _get_tl_client() -> TelegramClient:
         _tl_client = TelegramClient(
             "scheduler_uploader", API_ID, API_HASH,
             connection_retries=5,
-            # Use 10 parallel upload connections for maximum speed
-            upload_workers=10,
         )
         await _tl_client.start(bot_token=BOT_TOKEN)
         logger.info("[Scheduler] Telethon upload client started")
@@ -378,7 +376,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                         thumb=thumb_path,
                         attributes=[],
                         video_note=False,
-                        workers=10,
                         progress_callback=_progress_callback,
                     )
                 else:
@@ -390,7 +387,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                         reply_to=topic_id,
                         force_document=True,
                         attributes=[],
-                        workers=10,
                         progress_callback=_progress_callback,
                     )
                 logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
