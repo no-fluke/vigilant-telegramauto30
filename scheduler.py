@@ -46,7 +46,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
 from telethon import TelegramClient
-from telethon.tl.types import InputPeerChannel
+from telethon.tl.types import InputPeerChannel, DocumentAttributeVideo
 from telethon.errors import FloodWaitError
 
 import devgagantools
@@ -63,6 +63,9 @@ from vars import CREDIT, BOT_TOKEN, API_ID, API_HASH
 MAX_AUTOS_PER_USER = 100
 IST = timezone(timedelta(hours=5, minutes=30))
 logger = logging.getLogger(__name__)
+
+# Tracks active /runnow tasks so they can be cancelled cleanly on restart
+_active_runnow_tasks: dict = {}
 
 
 def _m():
@@ -412,6 +415,13 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         for attempt in range(4):
             try:
                 if is_video:
+                    _duration = _get_video_duration(file_path)
+                    _vid_attrs = [DocumentAttributeVideo(
+                        duration=_duration,
+                        w=1280,
+                        h=720,
+                        supports_streaming=True,
+                    )] if _duration else None
                     await tl.send_file(
                         supergroup_id,
                         uploaded_file,          # pre-uploaded InputFile handle
@@ -421,6 +431,8 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                         supports_streaming=True,
                         thumb=thumb_path,
                         video_note=False,
+                        duration=_duration or None,
+                        attributes=_vid_attrs,
                     )
                 else:
                     await tl.send_file(
@@ -1573,9 +1585,21 @@ async def runnow_handler(bot: Client, m: Message):
         "Progress updates will appear below."
     )
 
+    # Cancel any existing run for this auto_id before starting a new one
+    existing = _active_runnow_tasks.get(auto_id)
+    if existing and not existing.done():
+        existing.cancel()
+        try:
+            await existing
+        except (asyncio.CancelledError, Exception):
+            pass
+
     async def _run_and_catch():
         try:
             await _run_auto_update(bot, doc)
+        except asyncio.CancelledError:
+            logger.warning(f"[Scheduler] /runnow #{auto_id} cancelled cleanly")
+            raise
         except Exception as e:
             logger.error(f"[Scheduler] /runnow crashed for auto #{auto_id}: {e}", exc_info=True)
             try:
@@ -1586,8 +1610,11 @@ async def runnow_handler(bot: Client, m: Message):
                 )
             except Exception:
                 pass
+        finally:
+            _active_runnow_tasks.pop(auto_id, None)
 
-    asyncio.create_task(_run_and_catch())
+    task = asyncio.create_task(_run_and_catch())
+    _active_runnow_tasks[auto_id] = task
 
 
 # ════════════════════════════════════════════════════════════════════════════
