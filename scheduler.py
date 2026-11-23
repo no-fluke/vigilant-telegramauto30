@@ -27,6 +27,22 @@ Captions used (identical to run_lecture_loop in main.py):
   Test  → 📝 `TestTitle`\n`N questions`\nSeries: SeriesName | Brand
 """
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Crypto shim — MUST run BEFORE any `from telethon import ...`
+#  Telethon caches `cryptg = None` on first import if cryptg is missing,
+#  falling back to slow pure-Python AES. We pre-seed sys.modules['cryptg']
+#  with `cryptogram` (OpenSSL/AES-NI backed, no Rust toolchain needed) so
+#  Telethon picks it up automatically. This fixes the 200 KB/s upload cap.
+# ════════════════════════════════════════════════════════════════════════════
+import sys as _sys
+try:
+    import cryptogram as _cryptogram
+    _sys.modules['cryptg'] = _cryptogram
+    del _cryptogram
+except ImportError:
+    pass
+del _sys
+
 import os
 import re
 import asyncio
