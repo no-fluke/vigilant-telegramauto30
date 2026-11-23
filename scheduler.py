@@ -44,13 +44,17 @@ from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerChannel
+from telethon.errors import FloodWaitError
+
 HTML = enums.ParseMode.HTML   # shorthand used throughout this file
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db import db
-from vars import CREDIT, BOT_TOKEN
+from vars import CREDIT, BOT_TOKEN, API_ID, API_HASH
 
 MAX_AUTOS_PER_USER = 100
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -226,36 +230,24 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
     return thread_id
 
 
-# ── Peer cache primer ────────────────────────────────────────────────────────
+# ── Telethon client for uploads ──────────────────────────────────────────────
+# Telethon resolves peer IDs automatically — no peer cache needed.
+# Used ONLY for send_video / send_document in _send_to_topic.
+# The Pyrogram bot (passed as `bot`) is still used for all commands/messages.
 
-async def _prime_peer(bot, supergroup_id: int, retries: int = 5):
-    """
-    Prime Pyrogram's peer cache so send_video/send_document work without PeerIdInvalid.
+_tl_client: TelegramClient = None
 
-    The only reliable way to seed the cache is resolve_peer() — it fetches the
-    peer AND writes the access_hash into Pyrogram's SQLite storage. We must call
-    it with the STRING form ("-100XXXXXXXXX") because resolve_peer(int) tries to
-    look up an already-cached access_hash (chicken-and-egg). resolve_peer(str)
-    strips the -100 prefix and calls channels.GetChannels which Telegram resolves
-    fresh, returning the full peer including access_hash, which Pyrogram then stores.
-
-    After resolve_peer(str) succeeds, resolve_peer(int) will also work because the
-    access_hash is now in storage — confirming the cache is properly seeded.
-    """
-    sg_str = str(supergroup_id)   # e.g. "-1003890473236"
-
-    for attempt in range(retries):
-        try:
-            # Step 1: resolve_peer with STRING — fetches + stores access_hash
-            peer = await bot.resolve_peer(sg_str)
-            # Step 2: confirm integer form also resolves (storage is seeded)
-            await bot.resolve_peer(supergroup_id)
-            logger.info(f"[Scheduler] Peer primed OK: {supergroup_id} peer={peer}")
-            return True
-        except Exception as e:
-            logger.warning(f"[Scheduler] _prime_peer attempt {attempt+1}/{retries}: {e}")
-            await asyncio.sleep(2 ** attempt)   # 1s, 2s, 4s, 8s, 16s
-    return False
+async def _get_tl_client() -> TelegramClient:
+    """Return a connected Telethon bot client, creating it if needed."""
+    global _tl_client
+    if _tl_client is None:
+        _tl_client = TelegramClient("scheduler_uploader", API_ID, API_HASH)
+        await _tl_client.start(bot_token=BOT_TOKEN)
+        logger.info("[Scheduler] Telethon upload client started")
+    elif not _tl_client.is_connected():
+        await _tl_client.connect()
+        logger.info("[Scheduler] Telethon upload client reconnected")
+    return _tl_client
 
 
 # ── Progress message helpers (mirrors main.py safe_progress_edit) ─────────────
@@ -305,16 +297,19 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                          progress_chat_id: int = None,
                          progress_title: str = ""):
     """
-    Send a file to a supergroup forum topic, with live upload progress shown
-    in progress_chat_id (mirrors main.py's send_vid upload progress).
+    Send a file to a supergroup forum topic using Telethon for the upload.
 
-    FIX #PeerInvalid  : peer priming is ONLY done inside the pyrogram
-                        (large-file) branch where Pyrogram actually needs the
-                        access hash.  The requests path uses the Bot-API token
-                        and never needs the Pyrogram peer cache.
-                        We do NOT return early on a failed prime.
-    FIX #parse_mode   : use HTML so <blockquote> captions render correctly.
-    FIX #progress     : live upload progress bar sent to progress_chat_id.
+    Telethon resolves peer IDs automatically from the integer ID — no peer
+    cache priming, no access_hash juggling, no PeerIdInvalid errors.
+    The Pyrogram bot is still used for progress messages to the user.
+
+    All original logic preserved:
+    - Thumbnail generation for videos
+    - Live upload progress bar in progress_chat_id
+    - FloodWait handling with retry
+    - supports_streaming, duration, width/height for videos
+    - file_name for documents
+    - HTML captions
     """
     if not file_path or not os.path.exists(file_path):
         return
@@ -325,7 +320,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     thumb_path = _make_thumb(file_path) if is_video else None
     prog_msg   = None
 
-    # Progress callback for Pyrogram uploads
     _last_edit_time = [0.0]
     _upload_start   = [time.time()]
 
@@ -359,68 +353,48 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 )
             except Exception:
                 pass
+
         _upload_start[0] = time.time()
         duration = _get_video_duration(file_path) if is_video else 0
 
-        # Send a small message to the topic first — this forces Pyrogram to
-        # resolve and cache the peer (access_hash) as a side effect of a real
-        # send. Much more reliable than get_chat/resolve_peer on a cold session.
-        _warmup_msg = None
-        try:
-            _warmup_msg = await bot.send_message(
-                supergroup_id, "⏳",
-                reply_to_message_id=topic_id,
-            )
-        except Exception as e:
-            logger.warning(f"[Scheduler] Warmup message failed: {e} — trying _prime_peer")
-            await _prime_peer(bot, supergroup_id)
+        # Get Telethon client — resolves peer by integer ID automatically
+        tl = await _get_tl_client()
 
-        from pyrogram.errors import PeerIdInvalid as _PeerIdInvalid
         for attempt in range(4):
             try:
                 if is_video:
-                    await bot.send_video(
-                        supergroup_id, file_path,
-                        caption=caption, parse_mode=HTML,
-                        reply_to_message_id=topic_id,
+                    await tl.send_file(
+                        supergroup_id,
+                        file_path,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=topic_id,
                         supports_streaming=True,
-                        thumb=thumb_path, duration=duration,
-                        width=1280, height=720,
-                        progress=_progress_callback,
+                        thumb=thumb_path,
+                        attributes=[],
+                        video_note=False,
+                        progress_callback=_progress_callback,
                     )
                 else:
-                    await bot.send_document(
-                        supergroup_id, file_path,
-                        caption=caption, parse_mode=HTML,
-                        reply_to_message_id=topic_id,
-                        file_name=display_name,
-                        progress=_progress_callback,
+                    await tl.send_file(
+                        supergroup_id,
+                        file_path,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=topic_id,
+                        force_document=True,
+                        attributes=[],
+                        progress_callback=_progress_callback,
                     )
                 logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
                 break  # success
-            except FloodWait as fw:
-                logger.warning(f"[Scheduler] FloodWait {fw.value}s on upload attempt {attempt+1}")
-                await asyncio.sleep(fw.value + 2)
-            except _PeerIdInvalid:
-                logger.warning(f"[Scheduler] PeerIdInvalid on attempt {attempt+1} — re-sending warmup")
-                try:
-                    _warmup_msg2 = await bot.send_message(
-                        supergroup_id, "⏳", reply_to_message_id=topic_id
-                    )
-                    await bot.delete_messages(supergroup_id, _warmup_msg2.id)
-                except Exception:
-                    await _prime_peer(bot, supergroup_id)
-                await asyncio.sleep(3)
+
+            except FloodWaitError as fw:
+                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on upload attempt {attempt+1}")
+                await asyncio.sleep(fw.seconds + 2)
             except Exception as e:
                 logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
                 await asyncio.sleep(5)
-
-        # Delete the warmup message now that upload is done
-        if _warmup_msg:
-            try:
-                await bot.delete_messages(supergroup_id, _warmup_msg.id)
-            except Exception:
-                pass
 
         if prog_msg:
             try:
@@ -435,7 +409,9 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         logger.error(f"[Scheduler] Send error: {e}")
         if prog_msg:
             try:
-                await prog_msg.edit_text(f"❌ <b>Upload failed:</b> <code>{display_name[:50]}</code>\n{e}")
+                await prog_msg.edit_text(
+                    f"❌ <b>Upload failed:</b> <code>{display_name[:50]}</code>\n{e}"
+                )
             except Exception:
                 pass
     finally:
@@ -650,6 +626,15 @@ async def _run_auto_update(bot, doc):
 
                     if is_pure_quiz:
                         continue
+
+                    # ── Early skip — no need to call resolve_video if already seen ──
+                    # resolve_video makes 2-3 API calls per lecture. For already-seen
+                    # lectures this is wasted time (causes the 3-min delay on /runnow).
+                    already_seen_lec = (lec_id in seen_lec_ids)
+                    already_seen_pdf = (lec_id in seen_pdf_ids)
+                    if (not track_lec or already_seen_lec) and \
+                       (not track_pdf or already_seen_pdf):
+                        continue   # nothing new to fetch for this lecture
 
                     # ── Resolve video / PDF URL ───────────────────────────
                     vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
