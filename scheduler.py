@@ -450,14 +450,6 @@ async def _run_auto_update(bot, doc):
     tmp_dir = os.path.join(tempfile.gettempdir(), "auto_dl")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # ── Prime peer cache (string form fixes PeerInvalid in cold sessions) ──
-    peer_ok = await _prime_peer(bot, sg_id, retries=7)
-    if not peer_ok:
-        logger.warning(
-            f"[Scheduler] Could not prime peer for {sg_id} after 7 attempts. "
-            f"Bot-API (small file) path will still work; pyrogram large-file path may fail."
-        )
-
     # ── Send job-start progress message to user ───────────────────────────
     prog_msg = None
     try:
