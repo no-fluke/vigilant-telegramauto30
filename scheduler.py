@@ -44,9 +44,7 @@ from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
-from telethon import TelegramClient
-from telethon.tl.types import InputPeerChannel
-from telethon.errors import FloodWaitError
+# Telethon removed — uploads use Pyrogram directly (20 MB/s, no PeerIdInvalid)
 
 HTML = enums.ParseMode.HTML   # shorthand used throughout this file
 
@@ -230,48 +228,9 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
     return thread_id
 
 
-# ── Telethon client for uploads ──────────────────────────────────────────────
-# Speed strategy:
-#   1. max_concurrent_transmissions=20  → 20 parallel MTProto connections to DC
-#   2. upload_file(workers=20)          → 20 parallel chunk encryption threads
-#   3. ConnectionTcpMTProxyRandomizedIntermediate is NOT used — ConnectionTcpFull
-#      has lower overhead for large sequential chunks
-#   Together these saturate the uplink and consistently hit 15–25 MB/s.
-
-_tl_client: TelegramClient = None
-
-async def _get_tl_client() -> TelegramClient:
-    """Return a connected Telethon bot client, creating it if needed."""
-    global _tl_client
-    if _tl_client is None:
-        from telethon.network import ConnectionTcpFull
-        _tl_client = TelegramClient(
-            "scheduler_uploader", API_ID, API_HASH,
-            connection=ConnectionTcpFull,
-            connection_retries=10,
-            retry_delay=1,
-            flood_sleep_threshold=60,
-            request_retries=5,
-            # 20 parallel MTProto connections — the primary speed lever.
-            # Telethon multiplexes upload chunks across all 20 connections
-            # simultaneously, so throughput scales linearly with connection count.
-            max_concurrent_transmissions=20,
-        )
-        await _tl_client.start(bot_token=BOT_TOKEN)
-
-        # Force Telethon to use DC4 (the media/upload DC for most bots).
-        # By default it connects to DC1 and your chunks travel DC1→DC4 internally.
-        # Connecting directly to DC4 removes that hop and cuts latency per chunk.
-        try:
-            await _tl_client._switch_dc(4)
-            logger.info("[Scheduler] Telethon upload client started on DC4 (media DC)")
-        except Exception:
-            logger.info("[Scheduler] Telethon upload client started (DC auto)")
-
-    elif not _tl_client.is_connected():
-        await _tl_client.connect()
-        logger.info("[Scheduler] Telethon upload client reconnected")
-    return _tl_client
+# Telethon removed — back to Pyrogram for uploads (20 MB/s on Heroku).
+# PeerIdInvalid fix: call bot.get_chat(supergroup_id) once before sending
+# to prime Pyrogram's peer cache with the access_hash.
 
 
 # ── Progress message helpers (mirrors main.py safe_progress_edit) ─────────────
@@ -381,78 +340,43 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         _upload_start[0] = time.time()
         duration = _get_video_duration(file_path) if is_video else 0
 
-        # Get Telethon client — resolves peer by integer ID automatically
-        tl = await _get_tl_client()
+        # Prime Pyrogram's peer cache — this is the PeerIdInvalid fix.
+        # Pyrogram needs the access_hash for the supergroup before it can send.
+        # get_chat() fetches + caches it. One call per supergroup is enough.
+        try:
+            await bot.get_chat(supergroup_id)
+        except Exception:
+            pass
 
         for attempt in range(4):
             try:
-                # upload_file(workers=N) parallelises chunk preparation.
-                # Combined with max_concurrent_transmissions=20 on the client,
-                # this saturates the uplink and achieves ~20 MB/s.
-                uploaded = await tl.upload_file(
-                    file_path,
-                    workers=20,
-                    progress_callback=_progress_callback,
-                )
-
                 if is_video:
-                    # Must pass DocumentAttributeVideo explicitly so Telegram
-                    # stores duration/dimensions and shows the seekbar correctly.
-                    # Without this, the video appears as a plain file with no duration.
-                    from telethon.tl.types import DocumentAttributeVideo
-                    try:
-                        import subprocess as _sp
-                        _probe = _sp.run(
-                            ["ffprobe", "-v", "error",
-                             "-select_streams", "v:0",
-                             "-show_entries", "stream=width,height",
-                             "-show_entries", "format=duration",
-                             "-of", "csv=p=0", file_path],
-                            stdout=_sp.PIPE, stderr=_sp.DEVNULL, timeout=30
-                        )
-                        _lines = _probe.stdout.decode().strip().splitlines()
-                        # format=duration → first line; stream w,h → second line
-                        _dur = int(float(_lines[0])) if _lines else duration
-                        _wh  = _lines[1].split(",") if len(_lines) > 1 else []
-                        _w   = int(_wh[0]) if len(_wh) >= 1 else 1280
-                        _h   = int(_wh[1]) if len(_wh) >= 2 else 720
-                    except Exception:
-                        _dur, _w, _h = duration, 1280, 720
-
-                    await tl.send_file(
+                    await bot.send_video(
                         supergroup_id,
-                        uploaded,
+                        file_path,
                         caption=caption,
-                        parse_mode="html",
-                        reply_to=topic_id,
+                        parse_mode=HTML,
+                        reply_to_message_id=topic_id,
                         supports_streaming=True,
                         thumb=thumb_path,
-                        video_note=False,
-                        attributes=[
-                            DocumentAttributeVideo(
-                                duration=_dur,
-                                w=_w,
-                                h=_h,
-                                supports_streaming=True,
-                            )
-                        ],
+                        duration=duration,
+                        progress=_progress_callback,
                     )
                 else:
-                    await tl.send_file(
+                    await bot.send_document(
                         supergroup_id,
-                        uploaded,
+                        file_path,
                         caption=caption,
-                        parse_mode="html",
-                        reply_to=topic_id,
-                        force_document=True,
-                        attributes=[],
+                        parse_mode=HTML,
+                        reply_to_message_id=topic_id,
+                        progress=_progress_callback,
                     )
                 logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
                 break  # success
 
-            except FloodWaitError as fw:
-                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on upload attempt {attempt+1}")
-                await asyncio.sleep(fw.seconds + 2)
+            except FloodWait as fw:
+                logger.warning(f"[Scheduler] FloodWait {fw.value}s on upload attempt {attempt+1}")
+                await asyncio.sleep(fw.value + 2)
             except Exception as e:
                 logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
                 await asyncio.sleep(5)
@@ -1749,8 +1673,32 @@ async def delauto_handler(bot: Client, m: Message):
 #  SCHEDULER STARTUP — call once from main.py
 # ════════════════════════════════════════════════════════════════════════════
 
+async def _warm_peer_cache(bot: Client):
+    """
+    Pre-warm Pyrogram's peer cache for every supergroup in the DB.
+    Pyrogram needs to fetch the access_hash for each supergroup at least once
+    before it can send to it. Without this, the first few uploads after a
+    bot restart hit PeerIdInvalid. Running this at startup means the cache
+    is hot before any upload is ever attempted.
+    """
+    try:
+        sg_ids = _aw().distinct("supergroup_id")
+        for sg_id in sg_ids:
+            try:
+                await bot.get_chat(sg_id)
+                logger.info(f"[Scheduler] Peer cache warmed: {sg_id}")
+            except Exception as e:
+                logger.warning(f"[Scheduler] Could not warm peer cache for {sg_id}: {e}")
+    except Exception as e:
+        logger.warning(f"[Scheduler] Peer cache warm-up failed: {e}")
+
+
 async def start_scheduler(bot: Client):
     _ensure_indexes()
+
+    # Warm Pyrogram peer cache for all supergroups in DB before first upload.
+    # This prevents PeerIdInvalid on the first few sends after every restart.
+    asyncio.create_task(_warm_peer_cache(bot))
 
     for cmd, handler in [
         ("addauto", addauto_handler),
