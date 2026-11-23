@@ -27,8 +27,6 @@ Captions used (identical to run_lecture_loop in main.py):
   Test  → 📝 `TestTitle`\n`N questions`\nSeries: SeriesName | Brand
 """
 
-# tgcrypto is installed — Telethon picks it up automatically for fast AES uploads.
-# Install with: pip install tgcrypto
 
 import os
 import re
@@ -50,6 +48,9 @@ from pyrogram.handlers import MessageHandler
 from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel
 from telethon.errors import FloodWaitError
+
+import devgagantools
+from devgagantools import fast_upload, progress_bar_str
 
 HTML = enums.ParseMode.HTML   # shorthand used throughout this file
 
@@ -303,19 +304,15 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                          progress_chat_id: int = None,
                          progress_title: str = ""):
     """
-    Send a file to a supergroup forum topic using Telethon for the upload.
+    Send a file to a supergroup forum topic.
 
-    Telethon resolves peer IDs automatically from the integer ID — no peer
-    cache priming, no access_hash juggling, no PeerIdInvalid errors.
-    The Pyrogram bot is still used for progress messages to the user.
+    Strategy:
+      1. devgagantools.fast_upload() — parallel MTProto upload via Telethon,
+         gives real multi-MB/s speeds instead of the 0.2 MB/s single-connection cap.
+      2. Telethon tl.send_file() with the returned InputFile handle — Telethon
+         resolves peer IDs from integer automatically, so no PeerIdInvalid ever.
 
-    All original logic preserved:
-    - Thumbnail generation for videos
-    - Live upload progress bar in progress_chat_id
-    - FloodWait handling with retry
-    - supports_streaming, duration, width/height for videos
-    - file_name for documents
-    - HTML captions
+    Progress bar is shown to the user via the Pyrogram bot (progress_chat_id).
     """
     if not file_path or not os.path.exists(file_path):
         return
@@ -326,82 +323,125 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     thumb_path = _make_thumb(file_path) if is_video else None
     prog_msg   = None
 
-    _last_edit_time = [0.0]
-    _upload_start   = [time.time()]
-
-    async def _progress_callback(current, total):
-        nonlocal prog_msg
-        now = time.time()
-        if now - _last_edit_time[0] < 3:
-            return
-        _last_edit_time[0] = now
-        bar   = _make_progress_bar(current, total)
-        pct   = current * 100 // total if total else 0
-        speed = current / max(now - _upload_start[0], 0.1) / (1024 * 1024)
-        text  = (
-            f"📤 <b>Uploading…</b>\n"
-            f"<code>{display_name[:45]}</code>\n"
-            f"[{bar}] {pct}%\n"
-            f"{_fmt_size(current)} / {_fmt_size(total)} @ {speed:.1f} MB/s"
-        )
-        if prog_msg and progress_chat_id:
-            prog_msg = await _safe_progress_edit(bot, progress_chat_id, prog_msg, text)
+    # ── Initial progress message ──────────────────────────────────────────
+    if progress_chat_id:
+        label = progress_title or display_name[:50]
+        try:
+            prog_msg = await bot.send_message(
+                progress_chat_id,
+                f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
+                f"📦 Size: {_fmt_size(file_size)}",
+                parse_mode=HTML
+            )
+        except Exception:
+            pass
 
     try:
-        if progress_chat_id:
-            label = progress_title or display_name[:50]
-            try:
-                prog_msg = await bot.send_message(
-                    progress_chat_id,
-                    f"📤 <b>Uploading…</b>\n<code>{label}</code>\n"
-                    f"📦 Size: {_fmt_size(file_size)}",
-                    parse_mode=HTML
-                )
-            except Exception:
-                pass
-
-        _upload_start[0] = time.time()
-        duration = _get_video_duration(file_path) if is_video else 0
-
-        # Get Telethon client — resolves peer by integer ID automatically
         tl = await _get_tl_client()
 
+        # ── devgagantools progress bar wrapper ────────────────────────────
+        # fast_upload accepts a progress_bar_function(done, total) → str
+        # We wrap it to also edit the Pyrogram progress message.
+        _last_edit = [0.0]
+        _start     = [time.time()]
+
+        def _pgbar(done, total):
+            # Build the display string (devgagantools calls this every chunk)
+            bar   = _make_progress_bar(done, total)
+            pct   = done * 100 // total if total else 0
+            speed = done / max(time.time() - _start[0], 0.1) / (1024 * 1024)
+            return (
+                f"📤 <b>Uploading…</b>\n"
+                f"<code>{display_name[:45]}</code>\n"
+                f"[{bar}] {pct}%\n"
+                f"{_fmt_size(done)} / {_fmt_size(total)} @ {speed:.1f} MB/s"
+            )
+
+        # Pyrogram message edit is async but devgagantools progress_bar_function
+        # is sync — use a background task with throttling to update the message.
+        async def _edit_loop():
+            nonlocal prog_msg
+            while True:
+                await asyncio.sleep(3)
+                # The loop exits when fast_upload finishes (task is cancelled)
+                if prog_msg and progress_chat_id:
+                    try:
+                        now = time.time()
+                        # Read last known progress from shared state
+                        done  = _progress_state[0]
+                        total = _progress_state[1]
+                        if total > 0:
+                            text = _pgbar(done, total)
+                            prog_msg = await _safe_progress_edit(
+                                bot, progress_chat_id, prog_msg, text, parse_mode=HTML
+                            )
+                    except Exception:
+                        pass
+
+        _progress_state = [0, file_size]
+
+        def _pgbar_with_state(done, total):
+            _progress_state[0] = done
+            _progress_state[1] = total
+            return _pgbar(done, total)
+
+        # Start background edit loop
+        edit_task = asyncio.create_task(_edit_loop())
+
+        try:
+            # ── FAST UPLOAD via devgagantools parallel MTProto ────────────
+            uploaded_file = await fast_upload(
+                client=tl,
+                file_location=file_path,
+                reply=None,                        # we handle progress ourselves
+                name=display_name,
+                progress_bar_function=_pgbar_with_state,
+                user_id=progress_chat_id,
+            )
+        finally:
+            edit_task.cancel()
+            try:
+                await edit_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info(f"[Scheduler] Fast upload done: {display_name} ({_fmt_size(file_size)})")
+
+        # ── Send via Telethon using the uploaded file handle ──────────────
+        # Telethon resolves supergroup_id (int) automatically — no PeerIdInvalid.
         for attempt in range(4):
             try:
                 if is_video:
                     await tl.send_file(
                         supergroup_id,
-                        file_path,
+                        uploaded_file,          # pre-uploaded InputFile handle
                         caption=caption,
                         parse_mode="html",
                         reply_to=topic_id,
                         supports_streaming=True,
                         thumb=thumb_path,
-                        attributes=[],
                         video_note=False,
-                        progress_callback=_progress_callback,
                     )
                 else:
                     await tl.send_file(
                         supergroup_id,
-                        file_path,
+                        uploaded_file,          # pre-uploaded InputFile handle
                         caption=caption,
                         parse_mode="html",
                         reply_to=topic_id,
                         force_document=True,
-                        attributes=[],
-                        progress_callback=_progress_callback,
                     )
-                logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
-                break  # success
+                logger.info(f"[Scheduler] Sent to topic: {display_name}")
+                break
 
             except FloodWaitError as fw:
-                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on upload attempt {attempt+1}")
+                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on send attempt {attempt+1}")
                 await asyncio.sleep(fw.seconds + 2)
             except Exception as e:
-                logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
+                logger.error(f"[Scheduler] Send error attempt {attempt+1}: {e}")
                 await asyncio.sleep(5)
 
+        # ── Done ──────────────────────────────────────────────────────────
         if prog_msg:
             try:
                 await prog_msg.edit_text(
@@ -412,7 +452,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 pass
 
     except Exception as e:
-        logger.error(f"[Scheduler] Send error: {e}")
+        logger.error(f"[Scheduler] _send_to_topic error: {e}")
         if prog_msg:
             try:
                 await prog_msg.edit_text(
