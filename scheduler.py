@@ -44,7 +44,9 @@ from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from pyrogram.handlers import MessageHandler
 
-# Telethon removed — uploads use Pyrogram directly (20 MB/s, no PeerIdInvalid)
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerChannel
+from telethon.errors import FloodWaitError
 
 HTML = enums.ParseMode.HTML   # shorthand used throughout this file
 
@@ -228,9 +230,27 @@ async def _get_or_create_topic(supergroup_id: int, name: str,
     return thread_id
 
 
-# Telethon removed — back to Pyrogram for uploads (20 MB/s on Heroku).
-# PeerIdInvalid fix: call bot.get_chat(supergroup_id) once before sending
-# to prime Pyrogram's peer cache with the access_hash.
+# ── Telethon client for uploads ──────────────────────────────────────────────
+# Telethon resolves peer IDs automatically — no peer cache needed.
+# Used ONLY for send_video / send_document in _send_to_topic.
+# The Pyrogram bot (passed as `bot`) is still used for all commands/messages.
+
+_tl_client: TelegramClient = None
+
+async def _get_tl_client() -> TelegramClient:
+    """Return a connected Telethon bot client, creating it if needed."""
+    global _tl_client
+    if _tl_client is None:
+        _tl_client = TelegramClient(
+            "scheduler_uploader", API_ID, API_HASH,
+            connection_retries=5,
+        )
+        await _tl_client.start(bot_token=BOT_TOKEN)
+        logger.info("[Scheduler] Telethon upload client started")
+    elif not _tl_client.is_connected():
+        await _tl_client.connect()
+        logger.info("[Scheduler] Telethon upload client reconnected")
+    return _tl_client
 
 
 # ── Progress message helpers (mirrors main.py safe_progress_edit) ─────────────
@@ -340,43 +360,41 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         _upload_start[0] = time.time()
         duration = _get_video_duration(file_path) if is_video else 0
 
-        # Prime Pyrogram's peer cache — this is the PeerIdInvalid fix.
-        # Pyrogram needs the access_hash for the supergroup before it can send.
-        # get_chat() fetches + caches it. One call per supergroup is enough.
-        try:
-            await bot.get_chat(supergroup_id)
-        except Exception:
-            pass
+        # Get Telethon client — resolves peer by integer ID automatically
+        tl = await _get_tl_client()
 
         for attempt in range(4):
             try:
                 if is_video:
-                    await bot.send_video(
+                    await tl.send_file(
                         supergroup_id,
                         file_path,
                         caption=caption,
-                        parse_mode=HTML,
-                        reply_to_message_id=topic_id,
+                        parse_mode="html",
+                        reply_to=topic_id,
                         supports_streaming=True,
                         thumb=thumb_path,
-                        duration=duration,
-                        progress=_progress_callback,
+                        attributes=[],
+                        video_note=False,
+                        progress_callback=_progress_callback,
                     )
                 else:
-                    await bot.send_document(
+                    await tl.send_file(
                         supergroup_id,
                         file_path,
                         caption=caption,
-                        parse_mode=HTML,
-                        reply_to_message_id=topic_id,
-                        progress=_progress_callback,
+                        parse_mode="html",
+                        reply_to=topic_id,
+                        force_document=True,
+                        attributes=[],
+                        progress_callback=_progress_callback,
                     )
                 logger.info(f"[Scheduler] Uploaded: {display_name} ({_fmt_size(file_size)})")
                 break  # success
 
-            except FloodWait as fw:
-                logger.warning(f"[Scheduler] FloodWait {fw.value}s on upload attempt {attempt+1}")
-                await asyncio.sleep(fw.value + 2)
+            except FloodWaitError as fw:
+                logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on upload attempt {attempt+1}")
+                await asyncio.sleep(fw.seconds + 2)
             except Exception as e:
                 logger.error(f"[Scheduler] Upload error attempt {attempt+1}: {e}")
                 await asyncio.sleep(5)
@@ -1673,32 +1691,8 @@ async def delauto_handler(bot: Client, m: Message):
 #  SCHEDULER STARTUP — call once from main.py
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _warm_peer_cache(bot: Client):
-    """
-    Pre-warm Pyrogram's peer cache for every supergroup in the DB.
-    Pyrogram needs to fetch the access_hash for each supergroup at least once
-    before it can send to it. Without this, the first few uploads after a
-    bot restart hit PeerIdInvalid. Running this at startup means the cache
-    is hot before any upload is ever attempted.
-    """
-    try:
-        sg_ids = _aw().distinct("supergroup_id")
-        for sg_id in sg_ids:
-            try:
-                await bot.get_chat(sg_id)
-                logger.info(f"[Scheduler] Peer cache warmed: {sg_id}")
-            except Exception as e:
-                logger.warning(f"[Scheduler] Could not warm peer cache for {sg_id}: {e}")
-    except Exception as e:
-        logger.warning(f"[Scheduler] Peer cache warm-up failed: {e}")
-
-
 async def start_scheduler(bot: Client):
     _ensure_indexes()
-
-    # Warm Pyrogram peer cache for all supergroups in DB before first upload.
-    # This prevents PeerIdInvalid on the first few sends after every restart.
-    asyncio.create_task(_warm_peer_cache(bot))
 
     for cmd, handler in [
         ("addauto", addauto_handler),
