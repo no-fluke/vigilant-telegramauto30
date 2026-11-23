@@ -19,10 +19,8 @@ RUN apk add --no-cache \
     npm \
     openssl-dev \
     python3-dev \
-    curl && \
-    # Install latest Rust via rustup instead of apk (apk rust is too old)
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
-    source "$HOME/.cargo/env" && \
+    rust \
+    cargo && \
     wget -q https://github.com/axiomatic-systems/Bento4/archive/v1.6.0-639.zip && \
     unzip v1.6.0-639.zip && \
     cd Bento4-1.6.0-639 && \
@@ -33,8 +31,6 @@ RUN apk add --no-cache \
     cp mp4decrypt /usr/local/bin/ && \
     cd ../.. && \
     rm -rf Bento4-1.6.0-639 v1.6.0-639.zip
-
-ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir -r requirements.txt \
