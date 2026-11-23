@@ -27,3 +27,4 @@ apscheduler
 telethon
 devgagantools
 
+cryptg
