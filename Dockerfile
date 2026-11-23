@@ -18,7 +18,9 @@ RUN apk add --no-cache \
     nodejs \
     npm \
     openssl-dev \
-    python3-dev && \
+    python3-dev \
+    rust \
+    cargo && \
     wget -q https://github.com/axiomatic-systems/Bento4/archive/v1.6.0-639.zip && \
     unzip v1.6.0-639.zip && \
     cd Bento4-1.6.0-639 && \
@@ -32,7 +34,6 @@ RUN apk add --no-cache \
 
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir -r requirements.txt \
-    && pip3 install --no-cache-dir cryptg \
     && pip3 install --no-cache-dir -U yt-dlp
 
 CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-8080} & python3 main.py"]
