@@ -25,5 +25,5 @@ Werkzeug==2.3.7
 setuptools<81
 apscheduler
 telethon
-
+cryptg
 
