@@ -112,6 +112,40 @@ def _save_auto(doc: dict):
 def _delete_auto(user_id: int, auto_id: int):
     _aw().delete_one({"user_id": user_id, "auto_id": auto_id})
 
+def _mark_seen(user_id: int, auto_id: int, subj_id: str, topic_id: str,
+               field: str, item_id: str):
+    """
+    Atomically add item_id to the seen-IDs list for a specific topic.
+    Called immediately after a successful send so a crash never causes re-download.
+    field is one of: last_lecture_ids, last_pdf_ids, last_quiz_ids
+    """
+    try:
+        _aw().update_one(
+            {"user_id": user_id, "auto_id": auto_id},
+            {"$addToSet": {
+                f"subjects.$[s].topics.$[t].{field}": item_id
+            }},
+            array_filters=[
+                {"s.subject_id": subj_id},
+                {"t.topic_id":   topic_id},
+            ]
+        )
+    except Exception as e:
+        logger.error(f"[Scheduler] _mark_seen failed uid={user_id} auto={auto_id} "
+                     f"subj={subj_id} topic={topic_id} field={field} id={item_id}: {e}")
+
+def _mark_test_seen(user_id: int, auto_id: int, subj_id: str, test_id: str):
+    """Atomically add test_id to subject-level last_test_ids."""
+    try:
+        _aw().update_one(
+            {"user_id": user_id, "auto_id": auto_id},
+            {"$addToSet": {"subjects.$[s].last_test_ids": test_id}},
+            array_filters=[{"s.subject_id": subj_id}]
+        )
+    except Exception as e:
+        logger.error(f"[Scheduler] _mark_test_seen failed uid={user_id} auto={auto_id} "
+                     f"subj={subj_id} test={test_id}: {e}")
+
 
 # ── Fresh login (non-interactive) ────────────────────────────────────────────
 
@@ -318,7 +352,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
     Progress bar is shown to the user via the Pyrogram bot (progress_chat_id).
     """
     if not file_path or not os.path.exists(file_path):
-        return
+        return False
     if not display_name:
         display_name = os.path.basename(file_path)
 
@@ -496,6 +530,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 )
             except Exception:
                 pass
+        return True
 
     except Exception as e:
         logger.error(f"[Scheduler] _send_to_topic error: {e}")
@@ -506,6 +541,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 )
             except Exception:
                 pass
+        return False
     finally:
         if thumb_path and os.path.exists(thumb_path):
             try:
@@ -677,7 +713,6 @@ async def _run_auto_update(bot, doc):
                     if has_quiz and track_quiz:
                         quiz_id = raw_qid or lec_id
                         if quiz_id and quiz_id not in seen_quiz_ids:
-                            new_quiz_ids.add(quiz_id)
                             try:
                                 questions = await main.fetch_quiz(
                                     session, api_base, quiz_id, appx_uid, hdr
@@ -695,18 +730,25 @@ async def _run_auto_update(bot, doc):
                                         f"<code>{len(questions)} questions</code>\n"
                                         f"<code>{i}/{total}</code> | Batch: {cname}"
                                     )
-                                    await _send_to_topic(
+                                    sent = await _send_to_topic(
                                         bot, sg_id, thread_id, qfile, q_cap,
                                         is_video=False,
                                         display_name=main.safe_filename(title) + "_quiz.html",
                                         progress_chat_id=user_id,
                                         progress_title=f"Quiz: {title[:40]}",
                                     )
-                                    total_new += 1
+                                    if sent:
+                                        # Mark seen only after confirmed send
+                                        new_quiz_ids.add(quiz_id)
+                                        seen_quiz_ids.add(quiz_id)
+                                        _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                                   "last_quiz_ids", quiz_id)
+                                        total_new += 1
                                     try:
                                         os.remove(qfile)
                                     except Exception:
                                         pass
+                            # If questions is empty or fetch failed → not marked seen → retried next run
 
                     if is_pure_quiz:
                         continue
@@ -733,7 +775,6 @@ async def _run_auto_update(bot, doc):
                     # ── PDF-type lecture ──────────────────────────────────
                     if vtype == "pdf":
                         if track_pdf and lec_id not in seen_pdf_ids:
-                            new_pdf_ids.add(lec_id)
                             if url:
                                 # Show download progress
                                 if prog_msg:
@@ -746,25 +787,31 @@ async def _run_auto_update(bot, doc):
                                     )
                                 pr = await main.download_pdf(url, out_path)
                                 if pr and os.path.exists(pr):
-                                    await _send_to_topic(
+                                    sent = await _send_to_topic(
                                         bot, sg_id, thread_id, pr, cc1,
                                         is_video=False,
                                         display_name=main.safe_filename(title) + ".pdf",
                                         progress_chat_id=user_id,
                                         progress_title=f"PDF: {title[:40]}",
                                     )
-                                    total_new += 1
+                                    if sent:
+                                        # Mark seen only after confirmed send
+                                        new_pdf_ids.add(lec_id)
+                                        seen_pdf_ids.add(lec_id)
+                                        _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                                   "last_pdf_ids", lec_id)
+                                        total_new += 1
                                     try:
                                         os.remove(pr)
                                     except Exception:
                                         pass
+                                # If download failed or file missing → not marked seen → retried next run
                             for idx2, (suffix, purl) in enumerate(class_pdfs, start=2):
                                 if not purl:
                                     continue
                                 pid = f"{lec_id}{suffix}"
                                 if pid in seen_pdf_ids:
                                     continue
-                                new_pdf_ids.add(pid)
                                 pr2 = await main.download_pdf(
                                     purl, f"{out_path}_extra_{idx2}"
                                 )
@@ -775,7 +822,7 @@ async def _run_auto_update(bot, doc):
                                         f"<blockquote>Batch: {cname}</blockquote>\n"
                                         f"Extracted by ➤ {brand}"
                                     )
-                                    await _send_to_topic(
+                                    sent2 = await _send_to_topic(
                                         bot, sg_id, thread_id, pr2, cc_extra,
                                         is_video=False,
                                         display_name=main.safe_filename(
@@ -784,7 +831,12 @@ async def _run_auto_update(bot, doc):
                                         progress_chat_id=user_id,
                                         progress_title=f"PDF p{idx2}: {title[:35]}",
                                     )
-                                    total_new += 1
+                                    if sent2:
+                                        new_pdf_ids.add(pid)
+                                        seen_pdf_ids.add(pid)
+                                        _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                                   "last_pdf_ids", pid)
+                                        total_new += 1
                                     try:
                                         os.remove(pr2)
                                     except Exception:
@@ -799,17 +851,21 @@ async def _run_auto_update(bot, doc):
                             pid = f"{lec_id}{suffix}"
                             if pid in seen_pdf_ids:
                                 continue
-                            new_pdf_ids.add(pid)
                             pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                             if pr and os.path.exists(pr):
-                                await _send_to_topic(
+                                sent = await _send_to_topic(
                                     bot, sg_id, thread_id, pr, cc1,
                                     is_video=False,
                                     display_name=main.safe_filename(title) + ".pdf",
                                     progress_chat_id=user_id,
                                     progress_title=f"PDF: {title[:40]}",
                                 )
-                                total_new += 1
+                                if sent:
+                                    new_pdf_ids.add(pid)
+                                    seen_pdf_ids.add(pid)
+                                    _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                               "last_pdf_ids", pid)
+                                    total_new += 1
                                 try:
                                     os.remove(pr)
                                 except Exception:
@@ -818,7 +874,6 @@ async def _run_auto_update(bot, doc):
                     # ── YouTube type — notify topic, skip download ─────────
                     if vtype == "youtube":
                         if track_lec and lec_id not in seen_lec_ids:
-                            new_lec_ids.add(lec_id)
                             try:
                                 await bot.send_message(
                                     sg_id,
@@ -828,9 +883,15 @@ async def _run_auto_update(bot, doc):
                                     f"🔗 {url}",
                                     reply_to_message_id=thread_id,
                                 )
+                                # Mark seen only after confirmed notify
+                                new_lec_ids.add(lec_id)
+                                seen_lec_ids.add(lec_id)
+                                _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                           "last_lecture_ids", lec_id)
                                 total_new += 1
                             except Exception as e:
                                 logger.error(f"[Scheduler] YT notify error: {e}")
+                                # Not marked seen → retried next run
                         continue
 
                     # ── encrypted.m URL — extract key before download ──────
@@ -842,7 +903,6 @@ async def _run_auto_update(bot, doc):
 
                     # ── New video lecture ─────────────────────────────────
                     if track_lec and lec_id not in seen_lec_ids and url:
-                        new_lec_ids.add(lec_id)
 
                         # ── Download progress (mirrors run_lecture_loop) ──
                         if prog_msg:
@@ -886,18 +946,25 @@ async def _run_auto_update(bot, doc):
                                         parse_mode=HTML
                                     )
                                 vid_ext = os.path.splitext(vid_file)[-1].lstrip(".")
-                                await _send_to_topic(
+                                sent = await _send_to_topic(
                                     bot, sg_id, thread_id, vid_file, cc,
                                     is_video=True,
                                     display_name=main.safe_filename(title) + f".{vid_ext}",
                                     progress_chat_id=user_id,
                                     progress_title=f"Video: {title[:40]}",
                                 )
-                                total_new += 1
+                                if sent:
+                                    # Mark seen only after confirmed send
+                                    new_lec_ids.add(lec_id)
+                                    seen_lec_ids.add(lec_id)
+                                    _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                               "last_lecture_ids", lec_id)
+                                    total_new += 1
                                 try:
                                     os.remove(vid_file)
                                 except Exception:
                                     pass
+                            # If vid_file not found after download → not marked seen → retried next run
 
                             # ── Send class PDFs attached to this video lecture ──
                             if track_pdf and class_pdfs:
@@ -907,17 +974,21 @@ async def _run_auto_update(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    new_pdf_ids.add(pid)
                                     pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
-                                        await _send_to_topic(
+                                        sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
                                             is_video=False,
                                             display_name=main.safe_filename(title) + ".pdf",
                                             progress_chat_id=user_id,
                                             progress_title=f"PDF: {title[:40]}",
                                         )
-                                        total_new += 1
+                                        if sent:
+                                            new_pdf_ids.add(pid)
+                                            seen_pdf_ids.add(pid)
+                                            _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                                       "last_pdf_ids", pid)
+                                            total_new += 1
                                         try:
                                             os.remove(pr)
                                         except Exception:
@@ -933,7 +1004,8 @@ async def _run_auto_update(bot, doc):
                                     f"</blockquote>",
                                     parse_mode=HTML
                                 )
-                            # Still send class PDFs even when video download fails
+                            # Video failed → not marked seen → retried next run
+                            # Still try class PDFs even when video download fails
                             if track_pdf and class_pdfs:
                                 for suffix, purl in class_pdfs:
                                     if not purl:
@@ -941,17 +1013,21 @@ async def _run_auto_update(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    new_pdf_ids.add(pid)
                                     pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
-                                        await _send_to_topic(
+                                        sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
                                             is_video=False,
                                             display_name=main.safe_filename(title) + ".pdf",
                                             progress_chat_id=user_id,
                                             progress_title=f"PDF: {title[:40]}",
                                         )
-                                        total_new += 1
+                                        if sent:
+                                            new_pdf_ids.add(pid)
+                                            seen_pdf_ids.add(pid)
+                                            _mark_seen(user_id, auto_id, subj_id, topic_id,
+                                                       "last_pdf_ids", pid)
+                                            total_new += 1
                                         try:
                                             os.remove(pr)
                                         except Exception:
@@ -1037,12 +1113,12 @@ async def _run_auto_update(bot, doc):
                                       or f"Test_{test_id}")
                         if not test_id or test_id in seen_test_ids:
                             continue
-                        new_test_ids.add(test_id)
 
                         questions = await main.fetch_testseries_questions(
                             session, api_base, test, hdr
                         )
                         if not questions:
+                            # Questions not available yet → not marked seen → retried next run
                             continue
 
                         tbase       = os.path.join(tmp_dir, f"test_{test_id}")
@@ -1063,14 +1139,19 @@ async def _run_auto_update(bot, doc):
                             f"<code>{len(questions)} questions</code>\n"
                             f"Series: {series_name} | {brand}"
                         )
-                        await _send_to_topic(
+                        sent = await _send_to_topic(
                             bot, sg_id, ts_thread_id, actual_path, t_cap,
                             is_video=False,
                             display_name=main.safe_filename(test_title) + ".html",
                             progress_chat_id=user_id,
                             progress_title=f"Test: {test_title[:40]}",
                         )
-                        total_new += 1
+                        if sent:
+                            # Mark seen only after confirmed send
+                            new_test_ids.add(test_id)
+                            seen_test_ids.add(test_id)
+                            _mark_test_seen(user_id, auto_id, subj_id, test_id)
+                            total_new += 1
                         try:
                             os.remove(actual_path)
                         except Exception:
