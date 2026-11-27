@@ -42,9 +42,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pyromod import listen as _pyromod_listen  # patches Client with .listen()
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
-from pyrogram.handlers import MessageHandler
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 
 from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel, DocumentAttributeVideo
@@ -661,12 +661,123 @@ async def _run_auto_update(bot, doc):
         updated_subjects = []
         total_new = 0
 
+        # ── Discover newly-added AppX subjects for this course ────────────
+        # /addauto only snapshots the subjects picked at setup time. If AppX
+        # adds a whole new subject afterwards, silently auto-adding it would
+        # spam a bunch of new topic threads the owner never asked for — so
+        # instead we just ask, once per subject, via inline Yes/No buttons.
+        # The button handler (_on_subject_decision) does the actual adding;
+        # this block only detects + prompts, it never blocks the scheduler.
+        tracked_subject_ids = {str(s["subject_id"]) for s in doc.get("subjects", [])}
+        pending_subjects    = doc.get("pending_subjects", {}) or {}
+
+        await _throttle(api_base)
+        try:
+            live_subjects = await main.get_subjects(session, api_base, course_id, hdr)
+        except Exception as e:
+            logger.error(f"[Scheduler] get_subjects failed auto={auto_id}: {e}")
+            live_subjects = []
+
+        newly_pending = {}
+        for s in live_subjects or []:
+            s_id = str(s.get("id") or s.get("subjectid") or s.get("subject_id", ""))
+            s_name = s.get("subject_name") or s.get("name") or "Subject"
+            if not s_id or s_id in tracked_subject_ids or s_id in pending_subjects:
+                continue
+            newly_pending[s_id] = {"subject_name": s_name}
+
+        if newly_pending:
+            pending_subjects.update(newly_pending)
+            _aw().update_one(
+                {"user_id": user_id, "auto_id": auto_id},
+                {"$set": {"pending_subjects": pending_subjects}}
+            )
+            for s_id, info in newly_pending.items():
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🆕 <b>Auto #{auto_id} — {cname}</b>\n"
+                        f"New subject found: <b>{info['subject_name']}</b>\n\n"
+                        f"Add it to this auto-update?",
+                        parse_mode=HTML,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "✅ Yes, add it",
+                                callback_data=f"autosubj_add:{auto_id}:{s_id}"
+                            ),
+                            InlineKeyboardButton(
+                                "🚫 No, skip",
+                                callback_data=f"autosubj_skip:{auto_id}:{s_id}"
+                            ),
+                        ]])
+                    )
+                except Exception as e:
+                    logger.error(f"[Scheduler] Could not send new-subject prompt: {e}")
+
         for subj in doc.get("subjects", []):
             subj_id   = str(subj["subject_id"])
             subj_name = subj["subject_name"]
             updated_topics = []
 
             ts_topic_map = subj.get("ts_topic_map", {})
+
+            # ── Discover newly-added AppX topics for this subject ─────────
+            # /addauto only snapshots the topics that existed at setup time.
+            # If AppX adds a new topic to this subject afterwards, it's
+            # otherwise never seen. Each run, diff the live topic list
+            # against what's stored and auto-create a thread + tracking
+            # doc for anything new, so it joins the loop below right away.
+            known_topic_ids = {str(t["topic_id"]) for t in subj.get("topics", [])}
+            await _throttle(api_base)
+            try:
+                live_topics = await main.get_topics(
+                    session, api_base, course_id, subj_id, hdr
+                )
+            except Exception as e:
+                logger.error(f"[Scheduler] get_topics failed subj={subj_id}: {e}")
+                live_topics = []
+
+            new_topic_docs = []
+            for t in live_topics or []:
+                t_id   = str(t.get("topicid", ""))
+                t_name = t.get("topic_name", "Topic")
+                if not t_id or t_id in known_topic_ids:
+                    continue
+                new_thread_id = await _create_topic(sg_id, f"{subj_name} › {t_name}")
+                await asyncio.sleep(0.5)
+                if not new_thread_id:
+                    logger.warning(
+                        f"[Scheduler] Could not create thread for new topic "
+                        f"'{t_name}' (subj={subj_id})"
+                    )
+                    continue
+                new_topic_docs.append({
+                    "topic_id":         t_id,
+                    "topic_name":       t_name,
+                    "topic_thread_id":  new_thread_id,
+                    "last_lecture_ids": [],
+                    "last_pdf_ids":     [],
+                    "last_quiz_ids":    [],
+                })
+                known_topic_ids.add(t_id)
+
+            if new_topic_docs:
+                subj["topics"] = subj.get("topics", []) + new_topic_docs
+                logger.info(
+                    f"[Scheduler] Auto #{auto_id}: +{len(new_topic_docs)} new "
+                    f"topic(s) in {subj_name}"
+                )
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🆕 <b>Auto #{auto_id} — {cname}</b>\n"
+                        f"Found {len(new_topic_docs)} new topic(s) in "
+                        f"<b>{subj_name}</b>:\n"
+                        + "\n".join(f"• {t['topic_name']}" for t in new_topic_docs),
+                        parse_mode=HTML
+                    )
+                except Exception:
+                    pass
 
             for topic_doc in subj.get("topics", []):
                 topic_id   = str(topic_doc["topic_id"])
@@ -1908,6 +2019,141 @@ async def delauto_handler(bot: Client, m: Message):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  NEW-SUBJECT DECISION BUTTONS (from the prompt in _run_auto_update)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def _on_subject_decision(bot: Client, cq: CallbackQuery):
+    """
+    Handles the ✅/🚫 buttons on the "new subject found" prompt.
+    callback_data format: "autosubj_add:<auto_id>:<subject_id>"
+                        or "autosubj_skip:<auto_id>:<subject_id>"
+    """
+    try:
+        action, auto_id_s, subject_id = cq.data.split(":", 2)
+        auto_id = int(auto_id_s)
+    except Exception:
+        await cq.answer("Malformed button.", show_alert=True)
+        return
+
+    uid = cq.from_user.id
+    doc = _get_auto(uid, auto_id)
+    if not doc:
+        await cq.answer("Auto not found (maybe deleted).", show_alert=True)
+        return
+
+    pending = doc.get("pending_subjects", {}) or {}
+    info    = pending.pop(subject_id, None)
+    s_name  = info["subject_name"] if info else subject_id
+
+    if action == "autosubj_skip":
+        _aw().update_one(
+            {"user_id": uid, "auto_id": auto_id},
+            {"$set": {"pending_subjects": pending}}
+        )
+        await cq.answer("Skipped.")
+        try:
+            await cq.message.edit_text(
+                f"🚫 Skipped subject <b>{s_name}</b> for Auto #{auto_id}.",
+                parse_mode=HTML
+            )
+        except Exception:
+            pass
+        return
+
+    if action != "autosubj_add":
+        await cq.answer("Unknown action.", show_alert=True)
+        return
+
+    await cq.answer("Adding subject…")
+    try:
+        await cq.message.edit_text(
+            f"⏳ Adding <b>{s_name}</b> to Auto #{auto_id}…\n"
+            f"Fetching topics and creating threads.",
+            parse_mode=HTML
+        )
+    except Exception:
+        pass
+
+    main      = _m()
+    api_base  = doc["api_base"]
+    course_id = str(doc["course_id"])
+    sg_id     = doc["supergroup_id"]
+    token     = doc.get("appx_token", "")
+    appx_uid  = doc.get("appx_user_id", "")
+    hdr       = main.make_headers(token, appx_uid)
+
+    async with aiohttp.ClientSession() as session:
+        await _throttle(api_base)
+        try:
+            topics_raw = await main.get_topics(session, api_base, course_id, subject_id, hdr)
+        except Exception as e:
+            logger.error(f"[Scheduler] get_topics failed for new subject {subject_id}: {e}")
+            topics_raw = []
+
+    if not topics_raw:
+        topics_raw = [{"topicid": "0", "topic_name": s_name}]
+
+    topics_docs = []
+    for t in topics_raw:
+        t_name = t.get("topic_name", "Topic")
+        t_id   = str(t.get("topicid", ""))
+        thread_id = await _create_topic(sg_id, f"{s_name} › {t_name}")
+        await asyncio.sleep(0.5)
+        if not thread_id:
+            continue
+        topics_docs.append({
+            "topic_id":         t_id,
+            "topic_name":       t_name,
+            "topic_thread_id":  thread_id,
+            "last_lecture_ids": [],
+            "last_pdf_ids":     [],
+            "last_quiz_ids":    [],
+        })
+
+    if not topics_docs:
+        # Put it back in pending so it can be retried instead of silently
+        # dropping the subject the owner explicitly asked to add.
+        pending[subject_id] = {"subject_name": s_name}
+        _aw().update_one(
+            {"user_id": uid, "auto_id": auto_id},
+            {"$set": {"pending_subjects": pending}}
+        )
+        try:
+            await cq.message.edit_text(
+                f"❌ Couldn't create any topic threads for <b>{s_name}</b>.\n"
+                f"Make sure the bot is admin with Manage Topics permission, "
+                f"then press the button again from this prompt — it's still pending.",
+                parse_mode=HTML
+            )
+        except Exception:
+            pass
+        return
+
+    new_subject_doc = {
+        "subject_id":    subject_id,
+        "subject_name":  s_name,
+        "topics":        topics_docs,
+        "ts_topic_map":  {},
+        "last_test_ids": [],
+    }
+    _aw().update_one(
+        {"user_id": uid, "auto_id": auto_id},
+        {
+            "$push": {"subjects": new_subject_doc},
+            "$set":  {"pending_subjects": pending},
+        }
+    )
+    try:
+        await cq.message.edit_text(
+            f"✅ <b>{s_name}</b> added to Auto #{auto_id} — "
+            f"{len(topics_docs)} topic thread(s) created.",
+            parse_mode=HTML
+        )
+    except Exception:
+        pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SCHEDULER STARTUP — call once from main.py
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1923,6 +2169,10 @@ async def start_scheduler(bot: Client):
         bot.add_handler(
             MessageHandler(handler, filters.command(cmd) & filters.private)
         )
+
+    bot.add_handler(
+        CallbackQueryHandler(_on_subject_decision, filters.regex(r"^autosubj_(add|skip):"))
+    )
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
