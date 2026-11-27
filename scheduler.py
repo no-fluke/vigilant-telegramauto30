@@ -31,7 +31,6 @@ Captions used (identical to run_lecture_loop in main.py):
 import os
 import re
 import asyncio
-import random
 import logging
 import tempfile
 import subprocess
@@ -42,9 +41,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pyromod import listen as _pyromod_listen  # patches Client with .listen()
 from pyrogram import Client, filters, enums
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message
 from pyrogram.errors import FloodWait
-from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.handlers import MessageHandler
 
 from telethon import TelegramClient
 from telethon.tl.types import InputPeerChannel, DocumentAttributeVideo
@@ -135,40 +134,6 @@ def _mark_seen(user_id: int, auto_id: int, subj_id: str, topic_id: str,
         logger.error(f"[Scheduler] _mark_seen failed uid={user_id} auto={auto_id} "
                      f"subj={subj_id} topic={topic_id} field={field} id={item_id}: {e}")
 
-def _mark_done(user_id: int, auto_id: int, subj_id: str, topic_id: str,
-               lec_id: str, ts: float):
-    """Remember WHEN a lecture was first seen complete (starts its re-check window)."""
-    try:
-        _aw().update_one(
-            {"user_id": user_id, "auto_id": auto_id},
-            {"$set": {f"subjects.$[s].topics.$[t].lec_done_at.{lec_id}": ts}},
-            array_filters=[{"s.subject_id": subj_id}, {"t.topic_id": topic_id}]
-        )
-    except Exception as e:
-        logger.error(f"[Scheduler] _mark_done failed lec={lec_id}: {e}")
-
-def _unmark_seen(user_id: int, auto_id: int, subj_id: str, topic_id: str,
-                 field: str, item_id: str):
-    try:
-        _aw().update_one(
-            {"user_id": user_id, "auto_id": auto_id},
-            {"$pull": {f"subjects.$[s].topics.$[t].{field}": item_id}},
-            array_filters=[{"s.subject_id": subj_id}, {"t.topic_id": topic_id}]
-        )
-    except Exception as e:
-        logger.error(f"[Scheduler] _unmark_seen failed {field}={item_id}: {e}")
-
-def _mark_test_seen_auto(user_id: int, auto_id: int, test_id: str):
-    """Add test_id to the AUTO-level seen list (test series are per course, not per subject)."""
-    try:
-        _aw().update_one({"user_id": user_id, "auto_id": auto_id},
-                         {"$addToSet": {"last_test_ids": test_id}})
-    except Exception as e:
-        logger.error(f"[Scheduler] _mark_test_seen_auto failed test={test_id}: {e}")
-
-def _ts_key(series_id) -> str:
-    return re.sub(r"[^0-9A-Za-z_-]", "_", str(series_id))
-
 def _mark_test_seen(user_id: int, auto_id: int, subj_id: str, test_id: str):
     """Atomically add test_id to subject-level last_test_ids."""
     try:
@@ -213,15 +178,8 @@ async def _fresh_login(session, api_base, phone, password):
 async def _validate_token(session, api_base, token, appx_uid) -> bool:
     main = _m()
     hdr = main.make_headers(token, appx_uid)
-    for attempt in range(3):
-        hits = _RL["hits"]
-        courses = await main.get_courses(session, api_base, appx_uid, hdr)
-        if courses:
-            return True
-        if _RL["hits"] == hits:          # no 429 involved → token really is invalid
-            return False
-        await asyncio.sleep(45)          # rate-limited, not invalid → wait and retry
-    return False
+    courses = await main.get_courses(session, api_base, appx_uid, hdr)
+    return bool(courses)
 
 
 # ── Thumbnail ────────────────────────────────────────────────────────────────
@@ -267,103 +225,18 @@ def _get_video_duration(path: str) -> int:
 # The only inter-call delay we keep is TOPIC_ITER_DELAY between topic iterations
 # (not between individual API calls) so the scheduler doesn't blast all topics back-to-back.
 
-TOPIC_ITER_DELAY = 4.0   # seconds between processing each topic/subject iteration
-RAND_DELAY_MIN   = 5     # random pause (seconds) before each AppX lookup — rate-limit safety
-RAND_DELAY_MAX   = 20
-
-RL_ABORT_STREAK  = 2     # this many consecutive 429-failed lookups → stop the run, resume later
-MAX_RL_RETRIES   = 6     # auto-resume attempts per day before giving up until tomorrow
-RECHECK_RECENT   = 0     # 0 = a finished lecture is NEVER looked up again. Set e.g. 5 to re-check
-                         # the newest 5 lectures of each topic for RECHECK_DAYS (late-added PDFs).
-
-class _RateLimitAbort(Exception):
-    """AppX keeps answering 429 — stop now, resume automatically after a cool-off."""
-
-_QUIZ_TYPES = {"QUIZ", "TEST", "ATTEMPT", "EXERCISE", "ASSIGNMENT"}
-
-def _is_pure_quiz_lec(lec: dict) -> bool:
-    mat = lec.get("material_type", "") or ""
-    return mat.upper() in _QUIZ_TYPES or ("quiz" in mat.lower() and mat.upper() != "VIDEO")
-
-def _prioritised(lectures: list):
-    """(index, lecture) pairs with videos/PDFs FIRST and pure quizzes last.
-    Original numbering is kept, so captions don't change."""
-    return sorted(enumerate(lectures, 1), key=lambda t: _is_pure_quiz_lec(t[1]))
-
-# Shared AppX rate-limit state (updated by the patched api_get below)
-_RL = {"hits": 0, "until": 0.0, "last_hit": 0.0}
-
-async def _rand_pause():
-    """Random 5-20s pause; doubled for 10 minutes after AppX last said 429."""
-    mult = 2 if (time.time() - _RL["last_hit"]) < 600 else 1
-    await asyncio.sleep(random.uniform(RAND_DELAY_MIN, RAND_DELAY_MAX) * mult)
-
-async def _api_get_tracked(session, url, headers, retries: int = 5):
-    """
-    Drop-in replacement for main.api_get (installed in start_scheduler).
-    Same behaviour, but on HTTP 429 it sets ONE shared cooldown that every
-    caller honours, uses longer jittered back-off, and retries 5 times.
-    """
-    for attempt in range(retries):
-        left = _RL["until"] - time.time()
-        if left > 0:
-            await asyncio.sleep(left)
-        try:
-            await asyncio.sleep(0.3)
-            async with session.get(url, headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status == 429:
-                    wait = min(30 * (attempt + 1), 180) + random.uniform(0, 10)
-                    _RL["hits"]    += 1
-                    _RL["last_hit"] = time.time()
-                    _RL["until"]    = time.time() + wait
-                    logger.warning(f"[Scheduler] AppX 429 — shared cooldown {wait:.0f}s "
-                                   f"(attempt {attempt+1}/{retries})")
-                    continue
-                if resp.status != 200:
-                    return {}
-                return await resp.json(content_type=None)
-        except Exception as e:
-            if attempt == retries - 1:
-                logger.warning(f"[Scheduler] AppX request error: {e}")
-            await asyncio.sleep(2)
-    return {}
-AUTO_GAP_DELAY   = 10    # seconds between two autos due in the same minute
-RECHECK_DAYS     = 7     # keep re-checking a finished lecture this long for late-added PDFs/videos
-
-
-# ── Logged wrappers: failures in these used to be completely silent ──────────
-
-async def _safe_dl_pdf(url, path):
-    try:
-        r = await _m().download_pdf(url, path)
-        if not r or not os.path.exists(r):
-            logger.warning(f"[Scheduler] download_pdf returned nothing: {url[:90]} -> {path}")
-            return None
-        return r
-    except Exception as e:
-        logger.error(f"[Scheduler] download_pdf crashed ({url[:90]}): {e}", exc_info=True)
-        return None
-
-async def _safe_dl_item(*args, **kwargs):
-    try:
-        return await _m().download_item(*args, **kwargs)
-    except Exception as e:
-        logger.error(f"[Scheduler] download_item crashed: {e}", exc_info=True)
-        return False
+TOPIC_ITER_DELAY = 1.0   # seconds between processing each topic/subject iteration
 
 
 # ── Supergroup topic helpers ──────────────────────────────────────────────────
 
 async def _create_topic(supergroup_id: int, name: str):
     try:
-        r = await asyncio.to_thread(
-            lambda: requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
-                json={"chat_id": supergroup_id, "name": f"📚 {name}"},
-                timeout=15
-            ).json()
-        )
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/createForumTopic",
+            json={"chat_id": supergroup_id, "name": f"📚 {name}"},
+            timeout=15
+        ).json()
         if r.get("ok"):
             return r["result"]["message_thread_id"]
         logger.error(f"[Scheduler] Topic creation failed: {r}")
@@ -371,21 +244,15 @@ async def _create_topic(supergroup_id: int, name: str):
         logger.error(f"[Scheduler] Topic creation error: {e}")
     return None
 
-async def _delete_topic(supergroup_id: int, thread_id: int) -> bool:
+async def _delete_topic(supergroup_id: int, thread_id: int):
     try:
-        r = await asyncio.to_thread(
-            lambda: requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
-                json={"chat_id": supergroup_id, "message_thread_id": int(thread_id)},
-                timeout=15
-            ).json()
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteForumTopic",
+            json={"chat_id": supergroup_id, "message_thread_id": thread_id},
+            timeout=10
         )
-        if not r.get("ok"):
-            logger.warning(f"[Scheduler] deleteForumTopic {thread_id} failed: {r}")
-        return bool(r.get("ok"))
-    except Exception as e:
-        logger.warning(f"[Scheduler] deleteForumTopic {thread_id} error: {e}")
-        return False
+    except Exception:
+        pass
 
 
 async def _get_or_create_topic(supergroup_id: int, name: str,
@@ -608,7 +475,6 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         try:
             # ── Send via Telethon using the uploaded file handle ──────────
             # Telethon resolves supergroup_id (int) automatically — no PeerIdInvalid.
-            sent_ok = False
             for attempt in range(4):
                 try:
                     if is_video:
@@ -640,14 +506,13 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                             progress_callback=_tl_progress,  # FIX #progress-not-showing
                         )
                     logger.info(f"[Scheduler] Sent to topic: {display_name}")
-                    sent_ok = True
                     break
 
                 except FloodWaitError as fw:
                     logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on send attempt {attempt+1}")
                     await asyncio.sleep(fw.seconds + 2)
                 except Exception as e:
-                    logger.error(f"[Scheduler] Send error attempt {attempt+1} ({display_name}): {e}", exc_info=True)
+                    logger.error(f"[Scheduler] Send error attempt {attempt+1}: {e}")
                     await asyncio.sleep(5)
         finally:
             edit_task.cancel()
@@ -656,13 +521,13 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
             except asyncio.CancelledError:
                 pass
 
-        if not sent_ok:
-            raise RuntimeError(f"send_file failed after 4 attempts: {display_name}")
-
         # ── Done ──────────────────────────────────────────────────────────
         if prog_msg:
             try:
-                await prog_msg.delete()   # no "✅ Uploaded" message left in DM
+                await prog_msg.edit_text(
+                    f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>",
+                    parse_mode=HTML
+                )
             except Exception:
                 pass
         return True
@@ -689,7 +554,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
 #  CORE AUTO-UPDATE JOB
 # ════════════════════════════════════════════════════════════════════════════
 
-async def _run_auto_update_inner(bot, doc):
+async def _run_auto_update(bot, doc):
     main      = _m()
     user_id   = doc["user_id"]
     auto_id   = doc["auto_id"]
@@ -767,9 +632,6 @@ async def _run_auto_update_inner(bot, doc):
         hdr = main.make_headers(token, appx_uid)
         updated_subjects = []
         total_new = 0
-        failed_items = []
-        ts_list_cache = None
-        rl_streak = 0
 
         for subj in doc.get("subjects", []):
             subj_id   = str(subj["subject_id"])
@@ -777,37 +639,6 @@ async def _run_auto_update_inner(bot, doc):
             updated_topics = []
 
             ts_topic_map = subj.get("ts_topic_map", {})
-
-            # ── New topics added on AppX after /addauto → create thread + track ──
-            try:
-                known_tids = {str(t["topic_id"]) for t in subj.get("topics", [])}
-                await _rand_pause()
-                live_topics = await main.get_topics(session, api_base, course_id, subj_id, hdr)
-                for t in (live_topics or []):
-                    new_tid = str(t.get("topicid", ""))
-                    if not new_tid or new_tid in known_tids:
-                        continue
-                    new_tname = t.get("topic_name", "Topic")
-                    new_thread = await _create_topic(sg_id, f"{subj_name} › {new_tname}")
-                    if not new_thread:
-                        continue
-                    new_doc = {
-                        "topic_id": new_tid, "topic_name": new_tname,
-                        "topic_thread_id": new_thread,
-                        "last_lecture_ids": [], "last_pdf_ids": [],
-                        "last_quiz_ids": [], "lec_done_at": {},
-                    }
-                    _aw().update_one(
-                        {"user_id": user_id, "auto_id": auto_id},
-                        {"$push": {"subjects.$[s].topics": new_doc}},
-                        array_filters=[{"s.subject_id": subj_id}]
-                    )
-                    subj.setdefault("topics", []).append(new_doc)
-                    known_tids.add(new_tid)
-                    logger.info(f"[Scheduler] New topic discovered: {subj_name} › {new_tname}")
-                    await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.error(f"[Scheduler] topic discovery failed for {subj_name}: {e}", exc_info=True)
 
             for topic_doc in subj.get("topics", []):
                 topic_id   = str(topic_doc["topic_id"])
@@ -822,24 +653,16 @@ async def _run_auto_update_inner(bot, doc):
                 seen_lec_ids  = set(str(x) for x in topic_doc.get("last_lecture_ids", []))
                 seen_pdf_ids  = set(str(x) for x in topic_doc.get("last_pdf_ids",     []))
                 seen_quiz_ids = set(str(x) for x in topic_doc.get("last_quiz_ids",    []))
-                pdf_retry_ids = set(str(x) for x in topic_doc.get("last_pdfretry_ids", []))
-                now_ts  = time.time()
-                done_at = {str(k): float(v)
-                           for k, v in (topic_doc.get("lec_done_at") or {}).items()}
-                window  = RECHECK_DAYS * 86400
                 new_lec_ids   = set()
                 new_pdf_ids   = set()
                 new_quiz_ids  = set()
 
-                await _rand_pause()
                 lectures = await main.get_lectures(
                     session, api_base, course_id, subj_id, topic_id, hdr
                 )
                 total = len(lectures)
-                recent_ids = ({str(l.get("id")) for l in lectures[-RECHECK_RECENT:]}
-                              if RECHECK_RECENT > 0 else set())
 
-                for i, lec in _prioritised(lectures):
+                for i, lec in enumerate(lectures, 1):
                     lec_id = str(lec.get("id") or "")   # always str for consistent seen-ID checks
                     title  = lec.get("Title") or f"Lecture_{lec_id}"
                     mat    = lec.get("material_type", "")
@@ -890,8 +713,6 @@ async def _run_auto_update_inner(bot, doc):
                     if has_quiz and track_quiz:
                         quiz_id = raw_qid or lec_id
                         if quiz_id and quiz_id not in seen_quiz_ids:
-                            await asyncio.sleep(random.uniform(2, 5))
-                            _qh = _RL["hits"]
                             try:
                                 questions = await main.fetch_quiz(
                                     session, api_base, quiz_id, appx_uid, hdr
@@ -899,10 +720,6 @@ async def _run_auto_update_inner(bot, doc):
                             except Exception as e:
                                 logger.error(f"[Scheduler] fetch_quiz qid={quiz_id}: {e}")
                                 questions = []
-                            if not questions and _RL["hits"] > _qh:
-                                rl_streak += 1
-                                if rl_streak >= RL_ABORT_STREAK:
-                                    raise _RateLimitAbort("quiz lookups hit 429")
                             if questions:
                                 qfile = main.save_quiz_html(
                                     questions, out_path, title, watermark=brand
@@ -936,73 +753,24 @@ async def _run_auto_update_inner(bot, doc):
                     if is_pure_quiz:
                         continue
 
-                    # ── LEDGER CHECK — runs BEFORE any AppX call ─────────────────
-                    # A lecture that is already downloaded is never looked up again:
-                    #   • in the done-ledger (lec_done_at), or
-                    #   • its video is already in the seen list, or
-                    #   • PDF-only tracking / PDF-type lecture whose PDF is already sent.
-                    # Only a lecture whose attached PDF failed earlier (pdf_retry_ids) is
-                    # looked up again. Anything unsent / not released yet stays unseen and
-                    # is retried on every run.
-                    done_ts      = done_at.get(lec_id)
-                    have_video   = track_lec and lec_id in seen_lec_ids
-                    pdf_only_ok  = (not track_lec) and track_pdf and lec_id in seen_pdf_ids
-                    pdf_type_ok  = track_pdf and lec_id in seen_pdf_ids and mat.upper() == "PDF"
-                    finished     = bool(done_ts) or (
-                        (have_video or pdf_only_ok or pdf_type_ok) and lec_id not in pdf_retry_ids)
-                    if finished:
-                        if not done_ts:
-                            done_at[lec_id] = now_ts
-                            _mark_done(user_id, auto_id, subj_id, topic_id, lec_id, now_ts)
-                            continue
-                        if not (lec_id in recent_ids and (now_ts - done_ts) <= window):
-                            continue          # done → no AppX call at all
+                    # ── Early skip — no need to call resolve_video if already seen ──
+                    # resolve_video makes 2-3 API calls per lecture. For already-seen
+                    # lectures this is wasted time (causes the 3-min delay on /runnow).
+                    already_seen_lec = (lec_id in seen_lec_ids)
+                    already_seen_pdf = (lec_id in seen_pdf_ids)
+                    if (not track_lec or already_seen_lec) and \
+                       (not track_pdf or already_seen_pdf):
+                        continue   # nothing new to fetch for this lecture
 
                     # ── Resolve video / PDF URL ───────────────────────────
-                    await _rand_pause()
-                    try:
-                        _lec_hits = _RL["hits"]
-                        for _try in range(2):
-                            _hits = _RL["hits"]
-                            vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
-                                await main.resolve_video(
-                                    session, api_base, course_id, lec_id, hdr,
-                                    prefer_quality=prefer_q
-                                )
-                            empty = not url and not class_pdfs and not all_cands
-                            if empty and _RL["hits"] > _hits:
-                                logger.warning(f"[Scheduler] lec={lec_id} empty because of 429 — retry {_try+1}/2")
-                                await asyncio.sleep(30)
-                                continue
-                            break
-                    except Exception as e:
-                        logger.error(f"[Scheduler] resolve_video crashed lec={lec_id} "
-                                     f"'{title[:40]}': {e}", exc_info=True)
-                        failed_items.append(title)
-                        continue
-
-                    logger.info(f"[Scheduler] lec={lec_id} '{title[:40]}' mat={mat} "
-                                f"vtype={vtype} url={'yes' if url else 'NO'} "
-                                f"pdfs={len(class_pdfs or [])} cands={len(all_cands or [])}")
+                    vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
+                        await main.resolve_video(
+                            session, api_base, course_id, lec_id, hdr,
+                            prefer_quality=prefer_q
+                        )
 
                     if not url and not class_pdfs and not all_cands:
-                        logger.warning(f"[Scheduler] resolve_video gave nothing for lec={lec_id} '{title[:40]}'")
-                        failed_items.append(title)
-                        if _RL["hits"] > _lec_hits:
-                            rl_streak += 1
-                            if rl_streak >= RL_ABORT_STREAK:
-                                raise _RateLimitAbort(f"{rl_streak} lookups in a row hit 429")
                         continue
-                    rl_streak = 0
-
-                    if vtype != "pdf" and lec_id not in done_at and \
-                            ((not track_lec) or lec_id in seen_lec_ids):
-                        done_at[lec_id] = now_ts          # window starts now
-                        _mark_done(user_id, auto_id, subj_id, topic_id, lec_id, now_ts)
-
-                    if track_lec and vtype != "pdf" and not url and all_cands:
-                        logger.warning(f"[Scheduler] lec={lec_id} has candidates but no primary url "
-                                       f"— video skipped by 'and url' check")
 
                     # ── PDF-type lecture ──────────────────────────────────
                     if vtype == "pdf":
@@ -1017,7 +785,7 @@ async def _run_auto_update_inner(bot, doc):
                                         f"📚 {subj_name} → {topic_name}</blockquote>",
                                         parse_mode=HTML
                                     )
-                                pr = await _safe_dl_pdf(url, out_path)
+                                pr = await main.download_pdf(url, out_path)
                                 if pr and os.path.exists(pr):
                                     sent = await _send_to_topic(
                                         bot, sg_id, thread_id, pr, cc1,
@@ -1044,7 +812,7 @@ async def _run_auto_update_inner(bot, doc):
                                 pid = f"{lec_id}{suffix}"
                                 if pid in seen_pdf_ids:
                                     continue
-                                pr2 = await _safe_dl_pdf(
+                                pr2 = await main.download_pdf(
                                     purl, f"{out_path}_extra_{idx2}"
                                 )
                                 if pr2 and os.path.exists(pr2):
@@ -1073,10 +841,6 @@ async def _run_auto_update_inner(bot, doc):
                                         os.remove(pr2)
                                     except Exception:
                                         pass
-                        if lec_id not in done_at and \
-                                ((not track_pdf) or lec_id in seen_pdf_ids):
-                            done_at[lec_id] = now_ts
-                            _mark_done(user_id, auto_id, subj_id, topic_id, lec_id, now_ts)
                         continue
 
                     # ── PDFs attached to a video lecture ──────────────────
@@ -1087,7 +851,7 @@ async def _run_auto_update_inner(bot, doc):
                             pid = f"{lec_id}{suffix}"
                             if pid in seen_pdf_ids:
                                 continue
-                            pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
+                            pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                             if pr and os.path.exists(pr):
                                 sent = await _send_to_topic(
                                     bot, sg_id, thread_id, pr, cc1,
@@ -1131,12 +895,9 @@ async def _run_auto_update_inner(bot, doc):
                         continue
 
                     # ── encrypted.m URL — extract key before download ──────
-                    appx_enc_key = None
                     if url and "encrypted.m" in url:
                         parts = url.split("*", 1)
                         url   = parts[0]
-                        if len(parts) > 1:
-                            appx_enc_key = parts[1]
                         if len(parts) > 1 and not xor_key:
                             xor_key = parts[1]
 
@@ -1159,51 +920,19 @@ async def _run_auto_update_inner(bot, doc):
                         # Pass class_pdfs=[] and want_pdf=False to download_item so it
                         # only downloads the video — we send class PDFs ourselves below
                         # (so we can track them in seen_pdf_ids and send with proper caption).
-                        # Same downloaders as the manual flow (main.run_lecture_loop):
-                        # saini helper first (handles encrypted.m + yt-dlp headers),
-                        # then main.download_item as fallback.
-                        vid_file = None
-                        try:
-                            helper = main.helper
-                            if appx_enc_key:
-                                res_file = await helper.download_and_decrypt_video(
-                                    url, "", out_path, appx_enc_key)
-                            else:
-                                q_num = prefer_q.replace("p", "")
-                                ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
-                                hargs = (f'--add-header "Referer: {main.MEDIA_REFERER}" '
-                                         f'--add-header "User-Agent: {main.MEDIA_UA}" ')
-                                if main._is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
-                                    cmd = (f'yt-dlp {hargs} -f "{ytf}" -R 25 '
-                                           f'--fragment-retries 25 "{url}" -o "{out_path}.mp4"')
-                                else:
-                                    cmd = (f'yt-dlp {hargs} -f "{ytf}" --concurrent-fragments 16 '
-                                           f'--no-part -R 25 --fragment-retries 25 '
-                                           f'"{url}" -o "{out_path}.mp4"')
-                                res_file = await helper.download_video(url, cmd, out_path)
-                            if res_file and os.path.exists(str(res_file)):
-                                vid_file = str(res_file)
-                            else:
-                                logger.warning(f"[Scheduler] helper download gave nothing for '{title[:40]}'")
-                        except Exception as e:
-                            logger.error(f"[Scheduler] helper download crashed '{title[:40]}': {e}",
-                                         exc_info=True)
-
-                        ok = bool(vid_file)
-                        if not ok:
-                            ok = await _safe_dl_item(
-                                vtitle or title, url, xor_key, vtype,
-                                out_path, hdr=hdr,
-                                class_pdfs=[], want_pdf=False,
-                                all_candidates=all_cands
-                            )
+                        ok = await main.download_item(
+                            vtitle or title, url, xor_key, vtype,
+                            out_path, hdr=hdr,
+                            class_pdfs=[], want_pdf=False,
+                            all_candidates=all_cands
+                        )
                         if ok:
-                            if not vid_file:
-                                for ext in ("mp4", "mkv", "webm", "ts"):
-                                    fp = f"{out_path}.{ext}"
-                                    if os.path.exists(fp):
-                                        vid_file = fp
-                                        break
+                            vid_file = None
+                            for ext in ("mp4", "mkv", "webm", "ts"):
+                                fp = f"{out_path}.{ext}"
+                                if os.path.exists(fp):
+                                    vid_file = fp
+                                    break
                             if vid_file:
                                 file_mb = os.path.getsize(vid_file) / (1024 * 1024)
                                 if prog_msg:
@@ -1245,7 +974,7 @@ async def _run_auto_update_inner(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
+                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
                                         sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
@@ -1284,7 +1013,7 @@ async def _run_auto_update_inner(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
+                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
                                         sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
@@ -1304,70 +1033,141 @@ async def _run_auto_update_inner(bot, doc):
                                         except Exception:
                                             pass
 
-                    if vtype != "pdf" and ((not track_lec) or lec_id in seen_lec_ids):
-                        pdfs_ok = (not track_pdf) or all(
-                            f"{lec_id}{sfx}" in seen_pdf_ids for sfx, _u in (class_pdfs or []))
-                        if pdfs_ok:
-                            if lec_id not in done_at:
-                                done_at[lec_id] = now_ts
-                                _mark_done(user_id, auto_id, subj_id, topic_id, lec_id, now_ts)
-                            if lec_id in pdf_retry_ids:
-                                pdf_retry_ids.discard(lec_id)
-                                _unmark_seen(user_id, auto_id, subj_id, topic_id,
-                                             "last_pdfretry_ids", lec_id)
-                        elif lec_id not in pdf_retry_ids:
-                            # video is done but a PDF failed → look this lecture up again next run
-                            pdf_retry_ids.add(lec_id)
-                            _mark_seen(user_id, auto_id, subj_id, topic_id,
-                                       "last_pdfretry_ids", lec_id)
-
                     await asyncio.sleep(TOPIC_ITER_DELAY)  # brief pause between lectures
 
                 # ── Persist updated seen-ID sets ──────────────────────────
                 topic_doc["last_lecture_ids"] = list(seen_lec_ids | new_lec_ids)
                 topic_doc["last_pdf_ids"]     = list(seen_pdf_ids | new_pdf_ids)
                 topic_doc["last_quiz_ids"]    = list(seen_quiz_ids | new_quiz_ids)
-                topic_doc["lec_done_at"]      = done_at
-                topic_doc["last_pdfretry_ids"] = list(pdf_retry_ids)
-                topic_doc.pop("last_nopdf_ids", None)
                 topic_doc.pop("ts_topic_map", None)
                 topic_doc.pop("last_test_ids", None)
                 updated_topics.append(topic_doc)
 
+            # ── Test Series ONCE per subject ──────────────────────────────
+            seen_test_ids = set(str(x) for x in subj.get("last_test_ids", []))
+            new_test_ids  = set()
+
+            if track_tests:
+                ts_list = await main.get_test_series_list(
+                    session, api_base, appx_uid, course_id, hdr
+                )
+
+                for ts in ts_list:
+                    series_id   = str(ts.get("id") or ts.get("test_series_id", ""))
+                    series_name = (ts.get("title") or ts.get("name")
+                                   or f"Series_{series_id}")
+                    if not series_id:
+                        continue
+
+                    ts_thread_id = await _get_or_create_topic(
+                        sg_id, f"{subj_name} — {series_name}",
+                        ts_topic_map, series_id
+                    )
+                    if not ts_thread_id:
+                        ts_thread_id = next(
+                            (t.get("topic_thread_id")
+                             for t in updated_topics
+                             if t.get("topic_thread_id")),
+                            None
+                        )
+                        if not ts_thread_id:
+                            continue
+                    await asyncio.sleep(TOPIC_ITER_DELAY)
+
+                    ts_subjects = await main.get_testseries_subjects(
+                        session, api_base, series_id, hdr
+                    )
+                    matched_subj = None
+                    for ts_subj in ts_subjects:
+                        ts_sid   = str(ts_subj.get("id") or ts_subj.get("subjectid") or
+                                       ts_subj.get("subject_id", ""))
+                        ts_sname = (ts_subj.get("subject_name") or
+                                    ts_subj.get("name") or "").lower()
+                        if ts_sid == subj_id:
+                            matched_subj = ts_subj
+                            break
+                        if (subj_name.lower() in ts_sname or
+                                ts_sname in subj_name.lower()):
+                            matched_subj = ts_subj
+                            break
+                    if not matched_subj and ts_subjects:
+                        for ts_subj in ts_subjects:
+                            ts_sid = str(ts_subj.get("id") or ts_subj.get("subjectid") or
+                                         ts_subj.get("subject_id", "0"))
+                            if ts_sid in ("0", ""):
+                                matched_subj = ts_subj
+                                break
+                    if not matched_subj:
+                        continue
+
+                    matched_sid = str(matched_subj.get("id") or
+                                      matched_subj.get("subjectid") or
+                                      matched_subj.get("subject_id", "0"))
+                    tests = await main.get_testseries_tests(
+                        session, api_base, series_id, matched_sid, hdr
+                    )
+
+                    for test in tests:
+                        test_id    = str(test.get("id") or test.get("test_id", ""))
+                        test_title = (test.get("title") or test.get("name")
+                                      or f"Test_{test_id}")
+                        if not test_id or test_id in seen_test_ids:
+                            continue
+
+                        questions = await main.fetch_testseries_questions(
+                            session, api_base, test, hdr
+                        )
+                        if not questions:
+                            # Questions not available yet → not marked seen → retried next run
+                            continue
+
+                        tbase       = os.path.join(tmp_dir, f"test_{test_id}")
+                        actual_path = main.save_quiz_html(
+                            questions, tbase, test_title, watermark=brand
+                        )
+                        if not actual_path or not os.path.exists(actual_path):
+                            continue
+
+                        marks    = test.get("marks") or test.get("total_marks") or ""
+                        mins     = test.get("time")  or test.get("duration")    or ""
+                        meta     = []
+                        if marks: meta.append(f"{marks} marks")
+                        if mins:  meta.append(f"{mins} min")
+                        meta_str = f" <code>[{', '.join(meta)}]</code>" if meta else ""
+                        t_cap = (
+                            f"📝 <code>{test_title[:55]}</code>{meta_str}\n"
+                            f"<code>{len(questions)} questions</code>\n"
+                            f"Series: {series_name} | {brand}"
+                        )
+                        sent = await _send_to_topic(
+                            bot, sg_id, ts_thread_id, actual_path, t_cap,
+                            is_video=False,
+                            display_name=main.safe_filename(test_title) + ".html",
+                            progress_chat_id=user_id,
+                            progress_title=f"Test: {test_title[:40]}",
+                        )
+                        if sent:
+                            # Mark seen only after confirmed send
+                            new_test_ids.add(test_id)
+                            seen_test_ids.add(test_id)
+                            _mark_test_seen(user_id, auto_id, subj_id, test_id)
+                            total_new += 1
+                        try:
+                            os.remove(actual_path)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(TOPIC_ITER_DELAY)  # brief pause between tests
+
             # ── Persist subject-level data ────────────────────────────────
             subj["topics"]        = updated_topics
             subj["ts_topic_map"]  = ts_topic_map
-            subj["last_test_ids"] = list(subj.get("last_test_ids", []))
+            subj["last_test_ids"] = list(seen_test_ids | new_test_ids)
             updated_subjects.append(subj)
 
-        # Keep subjects added (via the "new subject" button) while this run was going
-        fresh_now = _get_auto(user_id, auto_id)
-        if not fresh_now:
-            logger.warning(f"[Scheduler] Auto #{auto_id} was deleted during the run")
-            return
-        _have = {str(x["subject_id"]) for x in updated_subjects}
-        updated_subjects += [x for x in fresh_now.get("subjects", [])
-                             if str(x["subject_id"]) not in _have]
         _aw().update_one(
             {"user_id": user_id, "auto_id": auto_id},
             {"$set": {"subjects": updated_subjects, "last_run_at": datetime.utcnow()}}
         )
-
-        # ── Test series: once per auto, EVERY series, EVERY series-subject ──
-        if track_tests:
-            try:
-                total_new += await _sync_test_series(
-                    bot, session, user_id, auto_id, api_base, course_id,
-                    appx_uid, hdr, sg_id, brand, tmp_dir)
-            except Exception as e:
-                logger.error(f"[Scheduler] test-series sync failed: {e}", exc_info=True)
-
-        # ── New subject on AppX? ask the owner ──
-        try:
-            await _check_new_subjects(bot, session, user_id, auto_id,
-                                      api_base, course_id, hdr, cname)
-        except Exception as e:
-            logger.error(f"[Scheduler] new-subject check failed: {e}", exc_info=True)
 
         # ── Final summary to user (mirrors main.py completion message) ────
         summary = (
@@ -1375,9 +1175,6 @@ async def _run_auto_update_inner(bot, doc):
             f"<blockquote><b>🎯 Batch: {cname}</b>\n"
             f"📦 New items sent: {total_new}</blockquote>"
         )
-        if failed_items:
-            summary += (f"\n⚠️ <b>{len(failed_items)} item(s) could not be fetched</b> "
-                        f"(see bot logs): " + ", ".join(t[:25] for t in failed_items[:5]))
         if prog_msg:
             try:
                 await prog_msg.edit_text(summary, parse_mode=HTML)
@@ -1395,294 +1192,17 @@ async def _run_auto_update_inner(bot, doc):
         logger.info(f"[Scheduler] ✅ Auto #{auto_id} for user {user_id} done. {total_new} new items.")
 
 
-async def _run_auto_update(bot, doc):
-    """Runs one auto. If AppX keeps rate-limiting, stops cleanly and schedules an
-    automatic resume (30 → 60 → 120 → 240 min). Progress is never lost: every sent
-    item is already saved as seen."""
-    user_id, auto_id = doc["user_id"], doc["auto_id"]
-    key = {"user_id": user_id, "auto_id": auto_id}
-    try:
-        await _run_auto_update_inner(bot, doc)
-        _aw().update_one(key, {"$unset": {"retry_at": "", "retry_attempts": ""}})
-    except _RateLimitAbort as e:
-        fresh    = _get_auto(user_id, auto_id) or {}
-        attempts = int(fresh.get("retry_attempts", 0)) + 1
-        if attempts > MAX_RL_RETRIES:
-            _aw().update_one(key, {"$unset": {"retry_at": ""}, "$set": {"retry_attempts": 0}})
-            text = (f"⚠️ <b>Auto #{auto_id} — AppX keeps rate-limiting.</b>\n"
-                    f"Stopped for today; it will try again at the next scheduled time "
-                    f"(or send <code>/runnow {auto_id}</code> later).")
-        else:
-            delay_min = min(30 * 2 ** (attempts - 1), 240)
-            retry_at  = time.time() + delay_min * 60
-            _aw().update_one(key, {"$set": {"retry_at": retry_at, "retry_attempts": attempts}})
-            when = datetime.fromtimestamp(retry_at, IST).strftime("%H:%M")
-            text = (f"⏸️ <b>Auto #{auto_id} paused — AppX rate limit.</b>\n"
-                    f"Nothing is lost. Resuming automatically at <code>{when}</code> IST "
-                    f"(attempt {attempts}/{MAX_RL_RETRIES}).")
-        logger.warning(f"[Scheduler] Auto #{auto_id} rate-limit abort: {e}")
-        try:
-            await bot.send_message(user_id, text, parse_mode=HTML)
-        except Exception:
-            pass
-
-
-async def _sync_test_series(bot, session, user_id, auto_id, api_base, course_id,
-                            appx_uid, hdr, sg_id, brand, tmp_dir) -> int:
-    """
-    Mirrors the manual flow: every test series of the course, every subject inside
-    the series, every test. ONE Telegram thread per series, created only when there
-    is something new to send, and its id is saved to the DB immediately so it is never
-    duplicated and /delauto can always remove it.
-    """
-    main = _m()
-    fresh = _get_auto(user_id, auto_id)
-    if not fresh:
-        return 0
-
-    ts_map = {_ts_key(k): v for k, v in (fresh.get("ts_topic_map") or {}).items()}
-    seen   = set(str(x) for x in fresh.get("last_test_ids", []))
-    for s_ in fresh.get("subjects", []):                 # legacy per-subject data
-        seen.update(str(x) for x in s_.get("last_test_ids", []))
-        for k, v in (s_.get("ts_topic_map") or {}).items():
-            ts_map.setdefault(_ts_key(k), v)             # reuse old thread, no new duplicate
-
-    ts_list = await main.get_test_series_list(session, api_base, appx_uid, course_id, hdr) or []
-    names   = [(t.get("title") or t.get("name") or "") for t in ts_list]
-    sent_count = 0
-
-    for ts in ts_list:
-        series_id = str(ts.get("id") or ts.get("test_series_id") or "")
-        if not series_id:
-            continue
-        series_name = ts.get("title") or ts.get("name") or f"Series_{series_id}"
-        label = series_name if names.count(series_name) == 1 else f"{series_name} #{series_id}"
-
-        await _rand_pause()
-        ts_subjects = await main.get_testseries_subjects(session, api_base, series_id, hdr)
-        if not ts_subjects:
-            ts_subjects = [{"subjectid": 0, "subject_name": "All Tests", "id": 0}]
-
-        all_tests = []
-        for ts_subj in ts_subjects:
-            sid_   = ts_subj.get("subjectid") or ts_subj.get("id") or 0
-            sname_ = ts_subj.get("subject_name") or ts_subj.get("name") or ""
-            tests  = await main.get_testseries_tests(session, api_base, series_id, sid_, hdr)
-            for t in tests:
-                t["_subject_name"] = sname_
-            all_tests.extend(tests)
-            await asyncio.sleep(TOPIC_ITER_DELAY)
-
-        new_tests, batch = [], set()
-        for t in all_tests:
-            tid = str(t.get("id") or t.get("test_id") or "")
-            if tid and tid not in seen and tid not in batch:
-                batch.add(tid)
-                new_tests.append((tid, t))
-        logger.info(f"[Scheduler] series '{series_name}': {len(all_tests)} tests, {len(new_tests)} new")
-        if not new_tests:
-            continue                                   # nothing to send → no thread created
-
-        key       = _ts_key(series_id)
-        thread_id = ts_map.get(key)
-        if not thread_id:
-            thread_id = await _create_topic(sg_id, label)
-            if not thread_id:
-                logger.error(f"[Scheduler] could not create thread for series '{series_name}'")
-                continue
-            ts_map[key] = thread_id
-        _aw().update_one({"user_id": user_id, "auto_id": auto_id},
-                         {"$set": {f"ts_topic_map.{key}": thread_id}})   # persist NOW
-
-        for tid, test in new_tests:
-            title = test.get("title") or test.get("name") or f"Test_{tid}"
-            await asyncio.sleep(random.uniform(2, 5))
-            questions = await main.fetch_testseries_questions(session, api_base, test, hdr)
-            if not questions:
-                continue                               # not available yet → retried next run
-            path = main.save_quiz_html(questions, os.path.join(tmp_dir, f"test_{tid}"),
-                                       title, watermark=brand)
-            if not path or not os.path.exists(path):
-                continue
-            marks = test.get("marks") or test.get("total_marks") or ""
-            mins  = test.get("time")  or test.get("duration")    or ""
-            meta  = [x for x in (f"{marks} marks" if marks else "", f"{mins} min" if mins else "") if x]
-            meta_str = f" <code>[{', '.join(meta)}]</code>" if meta else ""
-            subj_line = (f"Subject: {test['_subject_name']}\n"
-                         if test.get("_subject_name") else "")
-            cap = (f"📝 <code>{title[:55]}</code>{meta_str}\n"
-                   f"<code>{len(questions)} questions</code>\n"
-                   f"{subj_line}Series: {series_name} | {brand}")
-            sent = await _send_to_topic(
-                bot, sg_id, thread_id, path, cap, is_video=False,
-                display_name=main.safe_filename(title) + ".html",
-                progress_chat_id=user_id, progress_title=f"Test: {title[:40]}")
-            if sent:
-                seen.add(tid)
-                _mark_test_seen_auto(user_id, auto_id, tid)
-                sent_count += 1
-            try:
-                os.remove(path)
-            except Exception:
-                pass
-            await asyncio.sleep(TOPIC_ITER_DELAY)
-    return sent_count
-
-
-def _subj_ident(s: dict) -> str:
-    return str(s.get("id") or s.get("subjectid") or s.get("subject_id", ""))
-
-
-async def _check_new_subjects(bot, session, user_id, auto_id, api_base,
-                              course_id, hdr, cname):
-    """Ask the owner (once per subject) whether a newly appeared AppX subject should be added."""
-    main  = _m()
-    fresh = _get_auto(user_id, auto_id)
-    if not fresh:
-        return
-    live = await main.get_subjects(session, api_base, course_id, hdr) or []
-    live_ids = {_subj_ident(s) for s in live if _subj_ident(s)}
-    if "course_subject_ids" not in fresh:
-        # First run after this feature: remember what exists now, don't nag about it.
-        _aw().update_one({"user_id": user_id, "auto_id": auto_id},
-                         {"$set": {"course_subject_ids": sorted(live_ids)}})
-        return
-    known = {str(x) for x in fresh["course_subject_ids"]}
-    known |= {str(x["subject_id"]) for x in fresh.get("subjects", [])}
-    for s in live:
-        sid = _subj_ident(s)
-        if not sid or sid in known:
-            continue
-        sname = s.get("subject_name") or s.get("name") or "Subject"
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Add to auto-update", callback_data=f"asub:{auto_id}:{sid}:y"),
-            InlineKeyboardButton("❌ Ignore",             callback_data=f"asub:{auto_id}:{sid}:n"),
-        ]])
-        try:
-            await bot.send_message(
-                user_id,
-                f"🆕 <b>New subject found</b>\n"
-                f"<blockquote>Batch: {cname}\nSubject: <b>{sname}</b></blockquote>\n"
-                f"Add it to Auto #{auto_id}? Topic threads will be created for it.",
-                reply_markup=kb, parse_mode=HTML)
-            _aw().update_one({"user_id": user_id, "auto_id": auto_id},
-                             {"$addToSet": {"course_subject_ids": sid}})   # ask only once
-        except Exception as e:
-            logger.error(f"[Scheduler] could not send new-subject prompt: {e}")
-
-
-async def _ensure_token(session, doc):
-    token, appx_uid = doc.get("appx_token", ""), doc.get("appx_user_id", "")
-    api_base = doc["api_base"]
-    if token and appx_uid and await _validate_token(session, api_base, token, appx_uid):
-        return token, appx_uid
-    if doc.get("phone") and doc.get("password"):
-        token, appx_uid = await _fresh_login(session, api_base, doc["phone"], doc["password"])
-        if token:
-            _aw().update_one({"user_id": doc["user_id"], "auto_id": doc["auto_id"]},
-                             {"$set": {"appx_token": token, "appx_user_id": appx_uid}})
-            return token, appx_uid
-    return None, None
-
-
-async def newsubject_cb(bot: Client, cq):
-    main = _m()
-    try:
-        _, auto_s, sid, ans = cq.data.split(":")
-        auto_id = int(auto_s)
-    except Exception:
-        await cq.answer("Invalid button.", show_alert=True)
-        return
-    uid = cq.from_user.id
-    doc = _get_auto(uid, auto_id)
-    if not doc:
-        await cq.answer("This auto no longer exists.", show_alert=True)
-        return
-    if ans != "y":
-        await cq.answer("Ignored.")
-        await cq.message.edit_text("🚫 Subject ignored.")
-        return
-    if any(str(x["subject_id"]) == sid for x in doc.get("subjects", [])):
-        await cq.answer("Already added.")
-        await cq.message.edit_text("✅ Subject already added.")
-        return
-
-    await cq.answer("Adding…")
-    await cq.message.edit_text("⏳ Adding subject and creating topic threads…")
-    sg_id = doc["supergroup_id"]
-    async with aiohttp.ClientSession() as session:
-        token, appx_uid = await _ensure_token(session, doc)
-        if not token:
-            await cq.message.edit_text("❌ Login failed — could not add the subject.")
-            return
-        hdr  = main.make_headers(token, appx_uid)
-        subs = await main.get_subjects(session, doc["api_base"], str(doc["course_id"]), hdr) or []
-        sname = next((s.get("subject_name") or s.get("name") for s in subs
-                      if _subj_ident(s) == sid), None) or "Subject"
-        topics_raw = await main.get_topics(session, doc["api_base"], str(doc["course_id"]), sid, hdr)
-        if not topics_raw:
-            topics_raw = [{"topicid": "0", "topic_name": sname}]
-        topics_docs = []
-        for t in topics_raw:
-            tname = t.get("topic_name", "Topic")
-            thread = await _create_topic(sg_id, f"{sname} › {tname}")
-            await asyncio.sleep(0.5)
-            if not thread:
-                continue
-            topics_docs.append({
-                "topic_id": str(t.get("topicid", "")), "topic_name": tname,
-                "topic_thread_id": thread, "last_lecture_ids": [],
-                "last_pdf_ids": [], "last_quiz_ids": [], "lec_done_at": {},
-            })
-    if not topics_docs:
-        await cq.message.edit_text("❌ Could not create topic threads (bot needs Manage Topics).")
-        return
-    _aw().update_one(
-        {"user_id": uid, "auto_id": auto_id},
-        {"$push": {"subjects": {
-            "subject_id": sid, "subject_name": sname, "topics": topics_docs,
-            "ts_topic_map": {}, "last_test_ids": []}}}
-    )
-    await cq.message.edit_text(
-        f"✅ <b>{sname}</b> added to Auto #{auto_id} ({len(topics_docs)} topic thread(s)).\n"
-        f"It will be fetched on the next run — or send <code>/runnow {auto_id}</code>.",
-        parse_mode=HTML)
-
-
 async def run_all_due_autos(bot):
-    _now    = datetime.now(IST)
-    now_ist = _now.strftime("%H:%M")
-    today   = _now.strftime("%Y-%m-%d")
-    # Catch-up: run if the scheduled time has PASSED and it hasn't run today
-    # (covers bot restarts / a long previous run that swallowed the exact minute).
-    due = list(_aw().find({
-        "is_active": True,
-        "$or": [
-            {"check_time_ist": {"$lte": now_ist}, "last_scheduled_date": {"$ne": today}},
-            {"retry_at": {"$lte": time.time()}},          # resume after a rate-limit pause
-        ],
-    }))
+    now_ist = datetime.now(IST).strftime("%H:%M")
+    due = list(_aw().find({"check_time_ist": now_ist, "is_active": True}))
     if not due:
         return
     logger.info(f"[Scheduler] {len(due)} auto(s) due at {now_ist} IST")
-    for n, doc in enumerate(due):
-        if n:
-            await asyncio.sleep(AUTO_GAP_DELAY)
+    for doc in due:
         try:
             await _run_auto_update(bot, doc)
-            _aw().update_one({"user_id": doc["user_id"], "auto_id": doc["auto_id"]},
-                             {"$set": {"last_scheduled_date": today}})
         except Exception as e:
-            _aw().update_one({"user_id": doc["user_id"], "auto_id": doc["auto_id"]},
-                             {"$set": {"last_scheduled_date": today}})
-            logger.error(f"[Scheduler] Error in auto #{doc.get('auto_id')}: {e}", exc_info=True)
-            try:
-                await bot.send_message(
-                    doc["user_id"],
-                    f"❌ <b>Auto #{doc.get('auto_id')} crashed:</b>\n<code>{e}</code>",
-                    parse_mode=HTML)
-            except Exception:
-                pass
+            logger.error(f"[Scheduler] Error in auto #{doc.get('auto_id')}: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2054,8 +1574,6 @@ async def addauto_handler(bot: Client, m: Message):
         "track_tests":    track_tests,
         "subjects":       subjects_docs,
         "is_active":      True,
-        "last_scheduled_date": (datetime.now(IST).strftime("%Y-%m-%d")
-                                if time_input <= datetime.now(IST).strftime("%H:%M") else None),
         "added_at":       datetime.utcnow(),
         "last_run_at":    None,
     }
@@ -2142,7 +1660,6 @@ async def runnow_handler(bot: Client, m: Message):
     uid     = m.from_user.id
     args    = m.text.split()
     auto_id = None
-    reset   = len(args) > 2 and args[2].lower() == "reset"
     if len(args) > 1:
         try:
             auto_id = int(args[1])
@@ -2177,17 +1694,6 @@ async def runnow_handler(bot: Client, m: Message):
     if not doc:
         await m.reply_text(f"❌ Auto #{auto_id} not found.")
         return
-
-    if reset:
-        for _s in doc.get("subjects", []):
-            for _t in _s.get("topics", []):
-                _t["last_lecture_ids"] = []
-                _t["last_pdf_ids"]     = []
-                _t["lec_done_at"]      = {}
-                _t["last_pdfretry_ids"] = []
-        _aw().update_one({"user_id": uid, "auto_id": auto_id},
-                         {"$set": {"subjects": doc["subjects"]}})
-        await m.reply_text("♻️ Cleared the seen video/PDF list — everything will be re-sent.")
 
     await m.reply_text(
         f"🚀 <b>Running Auto #{auto_id} — {doc['course_name']} now…</b>\n"
@@ -2296,9 +1802,6 @@ async def delauto_handler(bot: Client, m: Message):
                     removed += 1
                 except Exception:
                     pass
-        for ts_tid in (doc.get("ts_topic_map") or {}).values():
-            if await _delete_topic(sg_id, ts_tid):
-                removed += 1
         _delete_auto(uid, auto_id)
         await m.reply_text(
             f"✅ <b>Auto #{auto_id} deleted.</b>\n"
@@ -2352,8 +1855,6 @@ async def delauto_handler(bot: Client, m: Message):
                 kept_subjects.append(s)
 
         if not kept_subjects:
-            for ts_tid in (doc.get("ts_topic_map") or {}).values():
-                await _delete_topic(sg_id, ts_tid)
             _delete_auto(uid, auto_id)
             await m.reply_text(
                 f"✅ All subjects removed — <b>Auto #{auto_id} fully deleted.</b>"
@@ -2387,15 +1888,6 @@ async def start_scheduler(bot: Client):
         bot.add_handler(
             MessageHandler(handler, filters.command(cmd) & filters.private)
         )
-
-    try:
-        _m().api_get = _api_get_tracked      # every main.* AppX call now shares one cooldown
-        logger.info("[Scheduler] main.api_get replaced with rate-limit-aware version")
-    except Exception as e:
-        logger.error(f"[Scheduler] could not patch api_get: {e}")
-
-    # group=-1 so no other callback handler in main.py can swallow it first
-    bot.add_handler(CallbackQueryHandler(newsubject_cb, filters.regex(r"^asub:")), group=-1)
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(
