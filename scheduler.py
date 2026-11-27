@@ -551,12 +551,11 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 pass
 
         # ── Done ──────────────────────────────────────────────────────────
+        # Just clean up the progress message instead of posting a final
+        # "✅ Uploaded: ..." line — the file landing in the topic is enough.
         if prog_msg:
             try:
-                await prog_msg.edit_text(
-                    f"✅ <b>Uploaded:</b> <code>{display_name[:50]}</code>",
-                    parse_mode=HTML
-                )
+                await prog_msg.delete()
             except Exception:
                 pass
         return True
