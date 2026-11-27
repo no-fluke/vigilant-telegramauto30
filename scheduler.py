@@ -267,7 +267,7 @@ def _get_video_duration(path: str) -> int:
 # The only inter-call delay we keep is TOPIC_ITER_DELAY between topic iterations
 # (not between individual API calls) so the scheduler doesn't blast all topics back-to-back.
 
-TOPIC_ITER_DELAY = 1.0   # seconds between processing each topic/subject iteration
+TOPIC_ITER_DELAY = 4.0   # seconds between processing each topic/subject iteration
 RAND_DELAY_MIN   = 5     # random pause (seconds) before each AppX lookup — rate-limit safety
 RAND_DELAY_MAX   = 20
 
