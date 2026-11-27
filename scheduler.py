@@ -228,6 +228,27 @@ def _get_video_duration(path: str) -> int:
 TOPIC_ITER_DELAY = 1.0   # seconds between processing each topic/subject iteration
 
 
+# ── Logged wrappers: failures in these used to be completely silent ──────────
+
+async def _safe_dl_pdf(url, path):
+    try:
+        r = await _m().download_pdf(url, path)
+        if not r or not os.path.exists(r):
+            logger.warning(f"[Scheduler] download_pdf returned nothing: {url[:90]} -> {path}")
+            return None
+        return r
+    except Exception as e:
+        logger.error(f"[Scheduler] download_pdf crashed ({url[:90]}): {e}", exc_info=True)
+        return None
+
+async def _safe_dl_item(*args, **kwargs):
+    try:
+        return await _m().download_item(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"[Scheduler] download_item crashed: {e}", exc_info=True)
+        return False
+
+
 # ── Supergroup topic helpers ──────────────────────────────────────────────────
 
 async def _create_topic(supergroup_id: int, name: str):
@@ -475,6 +496,7 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
         try:
             # ── Send via Telethon using the uploaded file handle ──────────
             # Telethon resolves supergroup_id (int) automatically — no PeerIdInvalid.
+            sent_ok = False
             for attempt in range(4):
                 try:
                     if is_video:
@@ -506,13 +528,14 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                             progress_callback=_tl_progress,  # FIX #progress-not-showing
                         )
                     logger.info(f"[Scheduler] Sent to topic: {display_name}")
+                    sent_ok = True
                     break
 
                 except FloodWaitError as fw:
                     logger.warning(f"[Scheduler] FloodWait {fw.seconds}s on send attempt {attempt+1}")
                     await asyncio.sleep(fw.seconds + 2)
                 except Exception as e:
-                    logger.error(f"[Scheduler] Send error attempt {attempt+1}: {e}")
+                    logger.error(f"[Scheduler] Send error attempt {attempt+1} ({display_name}): {e}", exc_info=True)
                     await asyncio.sleep(5)
         finally:
             edit_task.cancel()
@@ -520,6 +543,9 @@ async def _send_to_topic(bot, supergroup_id, topic_id, file_path, caption,
                 await edit_task
             except asyncio.CancelledError:
                 pass
+
+        if not sent_ok:
+            raise RuntimeError(f"send_file failed after 4 attempts: {display_name}")
 
         # ── Done ──────────────────────────────────────────────────────────
         if prog_msg:
@@ -632,6 +658,7 @@ async def _run_auto_update(bot, doc):
         hdr = main.make_headers(token, appx_uid)
         updated_subjects = []
         total_new = 0
+        failed_items = []
 
         for subj in doc.get("subjects", []):
             subj_id   = str(subj["subject_id"])
@@ -763,14 +790,30 @@ async def _run_auto_update(bot, doc):
                         continue   # nothing new to fetch for this lecture
 
                     # ── Resolve video / PDF URL ───────────────────────────
-                    vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
-                        await main.resolve_video(
-                            session, api_base, course_id, lec_id, hdr,
-                            prefer_quality=prefer_q
-                        )
+                    try:
+                        vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
+                            await main.resolve_video(
+                                session, api_base, course_id, lec_id, hdr,
+                                prefer_quality=prefer_q
+                            )
+                    except Exception as e:
+                        logger.error(f"[Scheduler] resolve_video crashed lec={lec_id} "
+                                     f"'{title[:40]}': {e}", exc_info=True)
+                        failed_items.append(title)
+                        continue
+
+                    logger.info(f"[Scheduler] lec={lec_id} '{title[:40]}' mat={mat} "
+                                f"vtype={vtype} url={'yes' if url else 'NO'} "
+                                f"pdfs={len(class_pdfs or [])} cands={len(all_cands or [])}")
 
                     if not url and not class_pdfs and not all_cands:
+                        logger.warning(f"[Scheduler] resolve_video gave nothing for lec={lec_id} '{title[:40]}'")
+                        failed_items.append(title)
                         continue
+
+                    if track_lec and vtype != "pdf" and not url and all_cands:
+                        logger.warning(f"[Scheduler] lec={lec_id} has candidates but no primary url "
+                                       f"— video skipped by 'and url' check")
 
                     # ── PDF-type lecture ──────────────────────────────────
                     if vtype == "pdf":
@@ -785,7 +828,7 @@ async def _run_auto_update(bot, doc):
                                         f"📚 {subj_name} → {topic_name}</blockquote>",
                                         parse_mode=HTML
                                     )
-                                pr = await main.download_pdf(url, out_path)
+                                pr = await _safe_dl_pdf(url, out_path)
                                 if pr and os.path.exists(pr):
                                     sent = await _send_to_topic(
                                         bot, sg_id, thread_id, pr, cc1,
@@ -812,7 +855,7 @@ async def _run_auto_update(bot, doc):
                                 pid = f"{lec_id}{suffix}"
                                 if pid in seen_pdf_ids:
                                     continue
-                                pr2 = await main.download_pdf(
+                                pr2 = await _safe_dl_pdf(
                                     purl, f"{out_path}_extra_{idx2}"
                                 )
                                 if pr2 and os.path.exists(pr2):
@@ -851,7 +894,7 @@ async def _run_auto_update(bot, doc):
                             pid = f"{lec_id}{suffix}"
                             if pid in seen_pdf_ids:
                                 continue
-                            pr = await main.download_pdf(purl, f"{out_path}{suffix}")
+                            pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
                             if pr and os.path.exists(pr):
                                 sent = await _send_to_topic(
                                     bot, sg_id, thread_id, pr, cc1,
@@ -895,9 +938,12 @@ async def _run_auto_update(bot, doc):
                         continue
 
                     # ── encrypted.m URL — extract key before download ──────
+                    appx_enc_key = None
                     if url and "encrypted.m" in url:
                         parts = url.split("*", 1)
                         url   = parts[0]
+                        if len(parts) > 1:
+                            appx_enc_key = parts[1]
                         if len(parts) > 1 and not xor_key:
                             xor_key = parts[1]
 
@@ -920,19 +966,51 @@ async def _run_auto_update(bot, doc):
                         # Pass class_pdfs=[] and want_pdf=False to download_item so it
                         # only downloads the video — we send class PDFs ourselves below
                         # (so we can track them in seen_pdf_ids and send with proper caption).
-                        ok = await main.download_item(
-                            vtitle or title, url, xor_key, vtype,
-                            out_path, hdr=hdr,
-                            class_pdfs=[], want_pdf=False,
-                            all_candidates=all_cands
-                        )
+                        # Same downloaders as the manual flow (main.run_lecture_loop):
+                        # saini helper first (handles encrypted.m + yt-dlp headers),
+                        # then main.download_item as fallback.
+                        vid_file = None
+                        try:
+                            helper = main.helper
+                            if appx_enc_key:
+                                res_file = await helper.download_and_decrypt_video(
+                                    url, "", out_path, appx_enc_key)
+                            else:
+                                q_num = prefer_q.replace("p", "")
+                                ytf   = f"b[height<={q_num}]/bv[height<={q_num}]+ba/b/bv+ba"
+                                hargs = (f'--add-header "Referer: {main.MEDIA_REFERER}" '
+                                         f'--add-header "User-Agent: {main.MEDIA_UA}" ')
+                                if main._is_mp4_url(url) or url.lower().split("?")[0].endswith(".mp4"):
+                                    cmd = (f'yt-dlp {hargs} -f "{ytf}" -R 25 '
+                                           f'--fragment-retries 25 "{url}" -o "{out_path}.mp4"')
+                                else:
+                                    cmd = (f'yt-dlp {hargs} -f "{ytf}" --concurrent-fragments 16 '
+                                           f'--no-part -R 25 --fragment-retries 25 '
+                                           f'"{url}" -o "{out_path}.mp4"')
+                                res_file = await helper.download_video(url, cmd, out_path)
+                            if res_file and os.path.exists(str(res_file)):
+                                vid_file = str(res_file)
+                            else:
+                                logger.warning(f"[Scheduler] helper download gave nothing for '{title[:40]}'")
+                        except Exception as e:
+                            logger.error(f"[Scheduler] helper download crashed '{title[:40]}': {e}",
+                                         exc_info=True)
+
+                        ok = bool(vid_file)
+                        if not ok:
+                            ok = await _safe_dl_item(
+                                vtitle or title, url, xor_key, vtype,
+                                out_path, hdr=hdr,
+                                class_pdfs=[], want_pdf=False,
+                                all_candidates=all_cands
+                            )
                         if ok:
-                            vid_file = None
-                            for ext in ("mp4", "mkv", "webm", "ts"):
-                                fp = f"{out_path}.{ext}"
-                                if os.path.exists(fp):
-                                    vid_file = fp
-                                    break
+                            if not vid_file:
+                                for ext in ("mp4", "mkv", "webm", "ts"):
+                                    fp = f"{out_path}.{ext}"
+                                    if os.path.exists(fp):
+                                        vid_file = fp
+                                        break
                             if vid_file:
                                 file_mb = os.path.getsize(vid_file) / (1024 * 1024)
                                 if prog_msg:
@@ -974,7 +1052,7 @@ async def _run_auto_update(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
+                                    pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
                                         sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
@@ -1013,7 +1091,7 @@ async def _run_auto_update(bot, doc):
                                     pid = f"{lec_id}{suffix}"
                                     if pid in seen_pdf_ids:
                                         continue
-                                    pr = await main.download_pdf(purl, f"{out_path}{suffix}")
+                                    pr = await _safe_dl_pdf(purl, f"{out_path}{suffix}")
                                     if pr and os.path.exists(pr):
                                         sent = await _send_to_topic(
                                             bot, sg_id, thread_id, pr, cc1,
@@ -1175,6 +1253,9 @@ async def _run_auto_update(bot, doc):
             f"<blockquote><b>🎯 Batch: {cname}</b>\n"
             f"📦 New items sent: {total_new}</blockquote>"
         )
+        if failed_items:
+            summary += (f"\n⚠️ <b>{len(failed_items)} item(s) could not be fetched</b> "
+                        f"(see bot logs): " + ", ".join(t[:25] for t in failed_items[:5]))
         if prog_msg:
             try:
                 await prog_msg.edit_text(summary, parse_mode=HTML)
@@ -1202,7 +1283,14 @@ async def run_all_due_autos(bot):
         try:
             await _run_auto_update(bot, doc)
         except Exception as e:
-            logger.error(f"[Scheduler] Error in auto #{doc.get('auto_id')}: {e}")
+            logger.error(f"[Scheduler] Error in auto #{doc.get('auto_id')}: {e}", exc_info=True)
+            try:
+                await bot.send_message(
+                    doc["user_id"],
+                    f"❌ <b>Auto #{doc.get('auto_id')} crashed:</b>\n<code>{e}</code>",
+                    parse_mode=HTML)
+            except Exception:
+                pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1660,6 +1748,7 @@ async def runnow_handler(bot: Client, m: Message):
     uid     = m.from_user.id
     args    = m.text.split()
     auto_id = None
+    reset   = len(args) > 2 and args[2].lower() == "reset"
     if len(args) > 1:
         try:
             auto_id = int(args[1])
@@ -1694,6 +1783,15 @@ async def runnow_handler(bot: Client, m: Message):
     if not doc:
         await m.reply_text(f"❌ Auto #{auto_id} not found.")
         return
+
+    if reset:
+        for _s in doc.get("subjects", []):
+            for _t in _s.get("topics", []):
+                _t["last_lecture_ids"] = []
+                _t["last_pdf_ids"]     = []
+        _aw().update_one({"user_id": uid, "auto_id": auto_id},
+                         {"$set": {"subjects": doc["subjects"]}})
+        await m.reply_text("♻️ Cleared the seen video/PDF list — everything will be re-sent.")
 
     await m.reply_text(
         f"🚀 <b>Running Auto #{auto_id} — {doc['course_name']} now…</b>\n"
