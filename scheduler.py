@@ -32,6 +32,7 @@ import os
 import re
 import asyncio
 import logging
+import random
 import tempfile
 import subprocess
 import time
@@ -178,6 +179,7 @@ async def _fresh_login(session, api_base, phone, password):
 async def _validate_token(session, api_base, token, appx_uid) -> bool:
     main = _m()
     hdr = main.make_headers(token, appx_uid)
+    await _throttle(api_base)
     courses = await main.get_courses(session, api_base, appx_uid, hdr)
     return bool(courses)
 
@@ -217,15 +219,42 @@ def _get_video_duration(path: str) -> int:
 
 # ── AppX API rate-limit helper ───────────────────────────────────────────────
 
-# NOTE: All AppX API calls go through main.py's api_get() which already has:
-#   - 0.3s delay before every request
-#   - 429 detection with escalating backoff: 15s → 30s → 45s
-#   - 3 retries with 2s sleep on error
-# We do NOT add extra sleeps around those calls — that would double-hammer.
-# The only inter-call delay we keep is TOPIC_ITER_DELAY between topic iterations
-# (not between individual API calls) so the scheduler doesn't blast all topics back-to-back.
+# NOTE: main.py's api_get() has a 0.3s delay + 429 backoff, but that only
+# throttles a single call site. It has no idea scheduler.py is about to fire
+# the SAME kind of call for the next topic, the next subject, or another
+# user's auto on the same AppX domain two seconds later. With many topics/
+# subjects (the common "just checking, nothing new" case) those 0.3s gaps
+# stack into a burst, which is what trips AppX's rate limit.
+#
+# Fix: a per-domain async throttle that every AppX list/metadata call goes
+# through, so calls to the SAME api_base are spaced out no matter which
+# topic, subject, or auto triggered them.
 
-TOPIC_ITER_DELAY = 1.0   # seconds between processing each topic/subject iteration
+TOPIC_ITER_DELAY     = 1.0   # seconds between processing each topic/subject iteration
+DOMAIN_DELAY_MIN     = 4.0   # randomized min seconds between ANY two AppX API calls to a domain
+DOMAIN_DELAY_MAX     = 8.0   # randomized max seconds between ANY two AppX API calls to a domain
+
+_domain_locks: dict = {}       # api_base -> asyncio.Lock
+_domain_last_call: dict = {}   # api_base -> monotonic timestamp of last call
+
+async def _throttle(api_base: str,
+                     min_delay: float = DOMAIN_DELAY_MIN,
+                     max_delay: float = DOMAIN_DELAY_MAX):
+    """
+    Serialize + space out every AppX API call (every "checking for new
+    files" call) per domain, with a random 4-8s gap each time rather than
+    a fixed one — a fixed delay is easy for rate limiting to still catch
+    in a pattern, a jittered one isn't. Call this immediately before any
+    main.get_*/fetch_*/resolve_video call.
+    """
+    lock = _domain_locks.setdefault(api_base, asyncio.Lock())
+    async with lock:
+        last     = _domain_last_call.get(api_base, 0.0)
+        required = random.uniform(min_delay, max_delay)
+        wait     = required - (time.monotonic() - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _domain_last_call[api_base] = time.monotonic()
 
 
 # ── Supergroup topic helpers ──────────────────────────────────────────────────
@@ -657,6 +686,7 @@ async def _run_auto_update(bot, doc):
                 new_pdf_ids   = set()
                 new_quiz_ids  = set()
 
+                await _throttle(api_base)
                 lectures = await main.get_lectures(
                     session, api_base, course_id, subj_id, topic_id, hdr
                 )
@@ -714,6 +744,7 @@ async def _run_auto_update(bot, doc):
                         quiz_id = raw_qid or lec_id
                         if quiz_id and quiz_id not in seen_quiz_ids:
                             try:
+                                await _throttle(api_base)
                                 questions = await main.fetch_quiz(
                                     session, api_base, quiz_id, appx_uid, hdr
                                 )
@@ -763,6 +794,7 @@ async def _run_auto_update(bot, doc):
                         continue   # nothing new to fetch for this lecture
 
                     # ── Resolve video / PDF URL ───────────────────────────
+                    await _throttle(api_base)
                     vtitle, url, xor_key, vtype, class_pdfs, all_cands = \
                         await main.resolve_video(
                             session, api_base, course_id, lec_id, hdr,
@@ -1048,6 +1080,7 @@ async def _run_auto_update(bot, doc):
             new_test_ids  = set()
 
             if track_tests:
+                await _throttle(api_base)
                 ts_list = await main.get_test_series_list(
                     session, api_base, appx_uid, course_id, hdr
                 )
@@ -1074,6 +1107,7 @@ async def _run_auto_update(bot, doc):
                             continue
                     await asyncio.sleep(TOPIC_ITER_DELAY)
 
+                    await _throttle(api_base)
                     ts_subjects = await main.get_testseries_subjects(
                         session, api_base, series_id, hdr
                     )
@@ -1103,6 +1137,7 @@ async def _run_auto_update(bot, doc):
                     matched_sid = str(matched_subj.get("id") or
                                       matched_subj.get("subjectid") or
                                       matched_subj.get("subject_id", "0"))
+                    await _throttle(api_base)
                     tests = await main.get_testseries_tests(
                         session, api_base, series_id, matched_sid, hdr
                     )
@@ -1114,6 +1149,7 @@ async def _run_auto_update(bot, doc):
                         if not test_id or test_id in seen_test_ids:
                             continue
 
+                        await _throttle(api_base)
                         questions = await main.fetch_testseries_questions(
                             session, api_base, test, hdr
                         )
