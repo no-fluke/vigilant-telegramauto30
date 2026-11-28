@@ -1,12 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════╗
-║         AppX / Parmar Academy Downloader             ║
-║           Telegram Bot Edition — v1.2                ║
-║   Fixes applied:                                     ║
-║     1. Multi-PDF per lecture (class_pdfs[1:] skip)  ║
-║     2. MP4 URL freshness check + 1MB chunk aiohttp  ║
-║     3. Option 6 — Download EVERYTHING in one shot   ║
-╚══════════════════════════════════════════════════════╝
+
 
 COMMANDS:
   /start   — Welcome screen
@@ -17,7 +9,6 @@ COMMANDS:
   /logs    — View bot logs
   /cookies — Upload YouTube cookies
   /getcookies — Get current cookies file
-  /mfile   — Get this main.py file
   /reset   — Restart bot (owner only)
   /addauth <user_id> <days> — Add premium user (owner only)
   /rmauth  <user_id>        — Remove user (owner only)
