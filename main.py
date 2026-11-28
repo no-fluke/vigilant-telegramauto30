@@ -2582,13 +2582,7 @@ async def getcookies_handler(client: Client, m: Message):
     except Exception as e:
         await m.reply_text(f"⚠️ {str(e)}")
 
-@bot.on_message(filters.command("mfile") & filters.private)
-async def mfile_handler(client: Client, m: Message):
-    try:
-        await client.send_document(chat_id=m.chat.id, document=m_file_path,
-                                   caption="Here is the `main.py` file.")
-    except Exception as e:
-        await m.reply_text(f"⚠️ {str(e)}")
+
 
 @bot.on_message(filters.command("reset"))
 async def restart_handler(_, m):
@@ -2642,7 +2636,7 @@ async def start(bot_client, m: Message):
             [InlineKeyboardButton("📞 Contact", url=f"tg://openmessage?user_id={OWNER}")],
         ])
         await m.reply_text(
-            f"🎉 Welcome **{m.from_user.first_name}** to **AppX Downloader Bot**!\n\n"
+            f"🎉 Welcome **{m.from_user.first_name}** to ** Downloader Bot**!\n\n"
             f"You are on the **free tier**. Contact [{CREDIT}](tg://openmessage?user_id={OWNER}) "
             f"to get Premium access.\n\n"
             f"Your ID: `{m.chat.id}`",
@@ -2680,8 +2674,8 @@ async def upgrade_callback(client, cq):
     await cq.message.edit_text(
         f"**💳 Premium Plans**\n\n"
         f"Get access to download from:\n"
-        f"<blockquote>• AppX Encrypted courses\n• Classplus (DRM + NDRM)\n"
-        f"• PhysicsWallah • CareerWill\n• Vimeo • YouTube + more</blockquote>\n\n"
+        f"<blockquote>• \n• \n"
+        f"• • \n• • </blockquote>\n\n"
         f"**Monthly: 100 INR**\n\n"
         f"Contact [{CREDIT}](tg://openmessage?user_id={OWNER}) to subscribe.",
         reply_markup=keyboard
@@ -2798,7 +2792,6 @@ def reset_and_set_commands():
         {"command": "logs",        "description": "👁️ View bot logs"},
         {"command": "cookies",     "description": "🍪 Upload YouTube cookies"},
         {"command": "getcookies",  "description": "📁 Get cookies file"},
-        {"command": "mfile",       "description": "📄 Get main.py"},
         {"command": "reset",       "description": "🔄 Restart bot (owner)"},
         {"command": "addauth",     "description": "▶️ Add user (owner)"},
         {"command": "rmauth",      "description": "⏸️ Remove user (owner)"},
